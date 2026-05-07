@@ -627,6 +627,48 @@ caliptra_status_t caliptra_fips_self_test(caliptra_ctx_t *ctx)
     return caliptra_mbox_send(ctx, &cmd);
 }
 
+caliptra_status_t caliptra_get_pcr_quote(caliptra_ctx_t *ctx,
+                                          const uint8_t *nonce,
+                                          uint8_t *quote_buf,
+                                          uint32_t *quote_size)
+{
+    DRV_CHECK(ctx);
+    if (!nonce || !quote_buf || !quote_size || *quote_size == 0)
+        return CALIPTRA_ERR_INVALID_PARAM;
+
+    caliptra_get_pcr_quote_req_t req = { 0 };
+    memcpy(req.nonce, nonce, 32);
+    req.chksum = caliptra_mbox_calc_checksum(&req, sizeof(req));
+
+    static uint8_t resp_buf[sizeof(caliptra_get_pcr_quote_resp_t)];
+    uint32_t resp_len = 0;
+
+    caliptra_mbox_cmd_t cmd = {
+        .cmd             = CALIPTRA_CMD_GET_PCR_QUOTE,
+        .req             = &req,
+        .req_len         = sizeof(req),
+        .resp            = resp_buf,
+        .resp_max_len    = sizeof(resp_buf),
+        .resp_actual_len = &resp_len,
+        .timeout_us      = ctx->mbox_timeout_us,
+    };
+
+    caliptra_status_t st = caliptra_mbox_send(ctx, &cmd);
+    if (st != CALIPTRA_OK) return st;
+
+    caliptra_get_pcr_quote_resp_t *resp = (caliptra_get_pcr_quote_resp_t *)resp_buf;
+    if (caliptra_mbox_verify_checksum(resp, resp_len) != 0)
+        return CALIPTRA_ERR_MBOX_STATUS;
+
+    if (resp->quote_size > *quote_size)
+        return CALIPTRA_ERR_BUFFER_TOO_SMALL;
+
+    memcpy(quote_buf, resp->quote, resp->quote_size);
+    *quote_size = resp->quote_size;
+    DRV_LOG(ctx, "Caliptra: PCR quote size=%u\n", resp->quote_size);
+    return CALIPTRA_OK;
+}
+
 caliptra_status_t caliptra_set_auth_manifest(caliptra_ctx_t *ctx,
                                               const void *manifest,
                                               uint32_t manifest_size)

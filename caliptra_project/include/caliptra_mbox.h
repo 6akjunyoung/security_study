@@ -315,4 +315,152 @@ static inline int caliptra_mbox_verify_checksum(const void *buf, uint32_t len_by
     return (sum == 0) ? 0 : -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * 암호화 서비스 (2.0+) - 추가 커맨드 구조체
+ * --------------------------------------------------------------------------- */
+
+/* CRYPTO_HMAC 요청/응답 (HMAC-SHA384) */
+#define CALIPTRA_HMAC_DATA_MAX  128
+
+typedef struct {
+    uint32_t              chksum;
+    caliptra_key_handle_t key_handle;              /* HMAC-SHA384 키 핸들 */
+    uint32_t              algorithm;               /* 0=HMAC-SHA384, 1=HMAC-SHA512 */
+    uint32_t              data_size;
+    uint8_t               data[CALIPTRA_HMAC_DATA_MAX];
+} caliptra_crypto_hmac_req_t;
+
+typedef struct {
+    uint32_t chksum;
+    uint32_t fips_status;
+    uint8_t  hmac[CALIPTRA_SHA384_HASH_SIZE];
+} caliptra_crypto_hmac_resp_t;
+
+/* CRYPTO_HKDF 요청/응답 (HKDF-SHA384) */
+#define CALIPTRA_HKDF_SALT_MAX  48
+#define CALIPTRA_HKDF_INFO_MAX  64
+#define CALIPTRA_HKDF_OKM_MAX   64
+
+typedef struct {
+    uint32_t              chksum;
+    caliptra_key_handle_t ikm_handle;                   /* IKM 키 핸들 */
+    uint32_t              salt_size;
+    uint8_t               salt[CALIPTRA_HKDF_SALT_MAX]; /* 0이면 zero-filled */
+    uint32_t              info_size;
+    uint8_t               info[CALIPTRA_HKDF_INFO_MAX]; /* Context/label */
+    uint32_t              okm_length;                   /* 출력 키 길이 (바이트, 최대 64) */
+} caliptra_crypto_hkdf_req_t;
+
+typedef struct {
+    uint32_t              chksum;
+    uint32_t              fips_status;
+    caliptra_key_handle_t okm_handle;   /* KV에 저장된 출력 키 핸들 */
+} caliptra_crypto_hkdf_resp_t;
+
+/* CRYPTO_ENCRYPT_AES / CRYPTO_DECRYPT_AES (AES-256-GCM) */
+#define CALIPTRA_AES_GCM_IV_SIZE   12
+#define CALIPTRA_AES_GCM_TAG_SIZE  16
+#define CALIPTRA_AES_MAX_PT_SIZE   64   /* 최대 평문 크기 (MEK: 32B, AES-256 key: 32B) */
+#define CALIPTRA_AES_AAD_MAX_SIZE  64
+
+typedef struct {
+    uint32_t              chksum;
+    caliptra_key_handle_t key_handle;                       /* AES-256 키 핸들 */
+    uint8_t               iv[CALIPTRA_AES_GCM_IV_SIZE];     /* 96-bit GCM IV */
+    uint32_t              aad_size;
+    uint8_t               aad[CALIPTRA_AES_AAD_MAX_SIZE];   /* 추가 인증 데이터 */
+    uint32_t              data_size;
+    uint8_t               data[CALIPTRA_AES_MAX_PT_SIZE];   /* 암호화/복호화할 데이터 */
+} caliptra_crypto_aes_req_t;
+
+typedef struct {
+    uint32_t chksum;
+    uint32_t fips_status;
+    uint8_t  tag[CALIPTRA_AES_GCM_TAG_SIZE];  /* GCM 인증 태그 */
+    uint32_t data_size;
+    uint8_t  data[CALIPTRA_AES_MAX_PT_SIZE];  /* 결과 데이터 */
+} caliptra_crypto_aes_resp_t;
+
+/* CRYPTO_ECDH_KEY_AGREE (P-384)
+ * generate_ephemeral=1이면 Caliptra가 내부에서 임시 키쌍을 생성하고 공개키를 반환합니다.
+ * OCP L.O.C.K. HPKE KEM에서 사용합니다. */
+typedef struct {
+    uint32_t              chksum;
+    uint8_t               generate_ephemeral;              /* 1=임시 키쌍 생성 (HPKE용) */
+    caliptra_key_handle_t private_key_handle;              /* generate_ephemeral=0일 때 사용 */
+    uint8_t               peer_pub_key[CALIPTRA_ECC384_PUBKEY_SIZE]; /* 상대방 P-384 공개키 */
+} caliptra_crypto_ecdh_req_t;
+
+typedef struct {
+    uint32_t              chksum;
+    uint32_t              fips_status;
+    caliptra_key_handle_t shared_secret_handle;            /* 공유 비밀 KV 핸들 */
+    uint8_t               eph_pub_key[CALIPTRA_ECC384_PUBKEY_SIZE]; /* generate_ephemeral=1일 때 임시 공개키 */
+} caliptra_crypto_ecdh_resp_t;
+
+/* ML-KEM-1024 크기 상수 */
+#define CALIPTRA_ML_KEM_1024_PUB_SIZE    1568
+#define CALIPTRA_ML_KEM_1024_CT_SIZE     1568
+#define CALIPTRA_ML_KEM_SHARED_KEY_SIZE  32
+
+/* CRYPTO_ML_KEM_ENCAP 요청/응답 */
+typedef struct {
+    uint32_t chksum;
+    uint8_t  recipient_pub_key[CALIPTRA_ML_KEM_1024_PUB_SIZE];
+} caliptra_crypto_ml_kem_encap_req_t;
+
+typedef struct {
+    uint32_t              chksum;
+    uint32_t              fips_status;
+    uint8_t               ciphertext[CALIPTRA_ML_KEM_1024_CT_SIZE]; /* 수신자에게 전달 */
+    caliptra_key_handle_t shared_secret_handle;                     /* 공유 비밀 KV 핸들 */
+} caliptra_crypto_ml_kem_encap_resp_t;
+
+/* CRYPTO_ML_KEM_DECAP 요청/응답 */
+typedef struct {
+    uint32_t              chksum;
+    caliptra_key_handle_t private_key_handle;
+    uint8_t               ciphertext[CALIPTRA_ML_KEM_1024_CT_SIZE];
+} caliptra_crypto_ml_kem_decap_req_t;
+
+typedef struct {
+    uint32_t              chksum;
+    uint32_t              fips_status;
+    caliptra_key_handle_t shared_secret_handle;
+} caliptra_crypto_ml_kem_decap_resp_t;
+
+/* CRYPTO_IMPORT_KEY 요청/응답 */
+#define CALIPTRA_IMPORT_KEY_MAX_SIZE  64
+
+typedef struct {
+    uint32_t            chksum;
+    caliptra_key_type_t key_type;
+    uint32_t            key_size;
+    uint8_t             key_data[CALIPTRA_IMPORT_KEY_MAX_SIZE];
+} caliptra_crypto_import_key_req_t;
+
+typedef struct {
+    uint32_t              chksum;
+    uint32_t              fips_status;
+    caliptra_key_handle_t handle;
+} caliptra_crypto_import_key_resp_t;
+
+/* CRYPTO_VERIFY (ECDSA P-384 / ML-DSA-87) */
+#define CALIPTRA_VERIFY_SIG_MAX_SIZE  CALIPTRA_MLDSA87_SIG_SIZE
+
+typedef struct {
+    uint32_t              chksum;
+    caliptra_key_handle_t pub_key_handle;
+    uint32_t              flags;             /* 0x01=ECDSA, 0x02=MLDSA */
+    uint8_t               digest[CALIPTRA_SHA384_HASH_SIZE];
+    uint32_t              sig_size;
+    uint8_t               sig[CALIPTRA_VERIFY_SIG_MAX_SIZE];
+} caliptra_crypto_verify_req_t;
+
+typedef struct {
+    uint32_t chksum;
+    uint32_t fips_status;
+    uint32_t verify_result;  /* 0=valid, 비0=invalid */
+} caliptra_crypto_verify_resp_t;
+
 #endif /* CALIPTRA_MBOX_H */
