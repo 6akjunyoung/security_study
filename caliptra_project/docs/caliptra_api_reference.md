@@ -21,10 +21,11 @@
 9. [PCR (측정값 저장소)](#9-pcr-측정값-저장소)
 10. [암호화 서비스 (2.0 신규)](#10-암호화-서비스-20-신규)
 11. [OCP Recovery / Streaming Boot (서브시스템 모드)](#11-ocp-recovery--streaming-boot-서브시스템-모드)
-12. [보안 상태 (Security State)](#12-보안-상태-security-state)
-13. [오류 처리](#13-오류-처리)
-14. [JTAG 디버그 레지스터](#14-jtag-디버그-레지스터)
-15. [C/C++ 통합 가이드](#15-cc-통합-가이드)
+12. [OCP L.O.C.K. — 스토리지 암호화 키 관리 (2.1+)](#12-ocp-lock--스토리지-암호화-키-관리-21)
+13. [보안 상태 (Security State)](#13-보안-상태-security-state)
+14. [오류 처리](#14-오류-처리)
+15. [JTAG 디버그 레지스터](#15-jtag-디버그-레지스터)
+16. [C/C++ 통합 가이드](#16-cc-통합-가이드)
 
 ---
 
@@ -545,7 +546,70 @@ BMC 등 외부 Recovery Agent가 I3C를 통해 접근:
 
 ---
 
-## 12. 보안 상태 (Security State)
+## 12. OCP L.O.C.K. — 스토리지 암호화 키 관리 (2.1+)
+
+OCP L.O.C.K. (Latch-On-Chip Key)는 SSD 등 스토리지 컨트롤러에 **Media Encryption Key (MEK)** 를 안전하게 전달하는 HW 아키텍처입니다.
+
+### 12.1 핵심 개념
+
+| 키 | 설명 |
+|----|------|
+| **HEK_SEED** | Fuse에 저장된 256 bit 시드. ROM이 읽어 HEK를 파생. 펌웨어에 노출되지 않음 |
+| **HEK** (Hardware Encryption Key) | HEK_SEED에서 HW가 파생. KV 슬롯에만 존재 |
+| **MEK** (Media Encryption Key) | RT FW가 생성/갱신하는 미디어 암호화 키. DMA로만 SSD 컨트롤러에 전달 |
+
+**보안 보장:**
+- MEK는 펌웨어가 직접 읽을 수 없음 — KV 슬롯 → AES 엔진 → DMA → SSD 컨트롤러 경로만 허용
+- DMA 목적지 주소는 `FUSE_WR_DONE` 이후 잠김 (Cold boot까지 변경 불가)
+- RT FW가 침해되어도 이전 MEK로 암호화된 데이터는 보호됨 (새 MEK 생성은 가능하나 복원 불가)
+
+### 12.2 SoC 통합 시 설정 사항
+
+| 항목 | 설명 |
+|------|------|
+| `OCP_LOCK_ENABLE` strap | HW tieoff 핀. 통합 시점에 고정. SW 변경 불가 |
+| MEK DMA 목적지 주소 | strap으로 설정. SSD 컨트롤러의 키 수신 레지스터 주소 |
+| `HEK_RATCHET_SEED` fuse | 256 bit, 현장 프로그래밍 가능. `caliptra_fuse_t.hek_ratchet_seed` |
+
+### 12.3 Fuse 설정
+
+```c
+/* HEK Ratchet Seed 프로그래밍 (현장, 소유자가 설정) */
+caliptra_fuse_t fuse = { 0 };
+/* ... 다른 fuse 항목 설정 ... */
+
+/* 256 bit (8 DWORDS) HEK seed 설정 */
+memcpy(fuse.hek_ratchet_seed, my_hek_seed, sizeof(fuse.hek_ratchet_seed));
+
+caliptra_program_fuses(&ctx, &fuse);  /* FUSE_WR_DONE까지 포함 */
+```
+
+### 12.4 동작 플로우
+
+```
+[Cold Boot]
+ROM: HEK_RATCHET_SEED fuse 읽기 → HEK 파생 → KV 슬롯 저장
+ROM: OCP_LOCK_IN_PROGRESS 설정 → KV 필터링/격리 활성화
+
+[Runtime]
+RT FW: Crypto Mailbox 커맨드로 MEK 생성 또는 래핑된 MEK 복원
+       └→ MEK는 KV 슬롯에만 존재 (FW 미접근)
+RT FW: DMA 트리거 → MEK가 KV 슬롯에서 SSD 컨트롤러로 자동 전달
+       └→ DMA 완료 후 FIFO 자동 플러시 (잔여 데이터 없음)
+
+[MEK 갱신]
+RT FW: 새 MEK 생성 후 AES로 래핑 → 래핑된 형태(obfuscated MEK)를 DCCM에 저장
+       └→ 다음 부팅 시 래핑 해제 → KV 슬롯 → DMA → SSD
+```
+
+### 12.5 SoC 책임 범위
+
+> Caliptra의 보안 경계는 **DMA write가 SSD 컨트롤러 목적지에 도달하는 시점**까지입니다.  
+> 목적지 이후의 기밀성/무결성은 **SoC 소유자의 책임**입니다.
+
+---
+
+## 13. 보안 상태 (Security State)
 
 `security_state[2:0]` 신호로 인코딩:
 

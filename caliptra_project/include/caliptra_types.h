@@ -109,6 +109,7 @@ typedef struct {
     uint32_t pqc_key_type;                 /* 2 bit: bit0=MLDSA, bit1=LMS */
     uint32_t soc_manifest_svn[4];          /* 128 bit */
     uint32_t manuf_debug_unlock_token[16]; /* 512 bit */
+    uint32_t hek_ratchet_seed[8];          /* 256 bit, OCP L.O.C.K. HEK 생성 시드 (2.1+, in-field) */
 } caliptra_fuse_t;
 
 /* 메일박스 커맨드 디스크립터 */

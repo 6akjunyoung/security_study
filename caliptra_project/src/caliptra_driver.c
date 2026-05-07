@@ -120,6 +120,10 @@ caliptra_status_t caliptra_program_fuses(caliptra_ctx_t *ctx,
     for (int i = 0; i < 4; i++)
         REG_W(ctx, CPTRA_FUSE_SOC_MANIFEST_SVN_BASE_OFFSET + i * 4, fuse->soc_manifest_svn[i]);
 
+    /* OCP L.O.C.K. HEK Ratchet Seed (256 bit = 8 DWORDS, 2.1+, in-field programmable) */
+    for (int i = 0; i < 8; i++)
+        REG_W(ctx, CPTRA_FUSE_HEK_RATCHET_SEED_BASE_OFFSET + i * 4, fuse->hek_ratchet_seed[i]);
+
     /* Fuse 쓰기 완료 → LOCK */
     REG_W(ctx, CPTRA_FUSE_WR_DONE_OFFSET, 1U);
 
