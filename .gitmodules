@@ -1,0 +1,3 @@
+[submodule "caliptra_project/Caliptra"]
+	path = caliptra_project/Caliptra
+	url = git@github.com:chipsalliance/Caliptra.git

@@ -1,0 +1,18 @@
+# Build outputs
+*.o
+*.a
+*.so
+*.exe
+*.elf
+build/
+out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
