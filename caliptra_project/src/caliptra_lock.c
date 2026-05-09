@@ -1,325 +1,379 @@
+// Licensed under the Apache-2.0 license
+
 /*
- * OCP L.O.C.K. (Layered Open Composable Key management) 구현
+ * OCP L.O.C.K. v1.0 구현
  *
- * caliptra_lock.h의 모든 함수를 구현합니다.
+ * caliptra_lock.h에 선언된 모든 OCP LOCK 커맨드 래퍼를 구현합니다.
+ * 각 함수는 caliptra_mailbox_execute()를 통해 Caliptra Runtime FW에
+ * 메일박스 요청을 전달합니다.
  *
- * 이 파일은 HPKE (Hybrid Public Key Encryption) 시퀀스를 오케스트레이션합니다.
- * 각 단계는 Caliptra 메일박스 커맨드를 통해 수행되며,
- * MEK plaintext는 항상 Caliptra Key Vault(KV) 내부에만 존재합니다.
+ * libcaliptra는 다음을 자동으로 처리합니다:
+ *   - 요청 체크섬 계산 (caliptra_req_header.chksum)
+ *   - 응답 체크섬 검증 (caliptra_resp_header.chksum)
+ *   - FIPS 상태 확인 (caliptra_resp_header.fips_status)
+ *   - 메일박스 잠금 획득/해제 (FSM: IDLE → LOCK → CMD → DATA → EXECUTE → DONE)
  *
- * 스펙: caliptra_project/Caliptra/doc/ocp_lock/
- * 다이어그램: hpke_kem_ecdh.drawio.svg, hpke_kem_mlkem.drawio.svg, hpke_kem_hybrid.drawio.svg
+ * 레퍼런스:
+ *   caliptra-sw/libcaliptra/inc/caliptra_api.h — caliptra_mailbox_execute
+ *   caliptra-sw/api/src/mailbox.rs             — Rust 커맨드 코드 및 구조체
  */
 
 #include <string.h>
-#include "../include/caliptra_lock.h"
+#include "caliptra_lock.h"
 
-/* ---------------------------------------------------------------------------
- * 내부 헬퍼: MEK 컨텍스트 → HKDF info 직렬화
- * HKDF info = drive_serial(32) || namespace_id(4) || lba_start(8) || lba_count(8)
- * --------------------------------------------------------------------------- */
-static uint32_t lock_serialize_mek_context(const caliptra_lock_mek_context_t *mek_ctx,
-                                            uint8_t *buf, uint32_t buf_size)
+/* ─────────────────────────────────────────────────────────────────────
+ * 내부 헬퍼 매크로
+ * ───────────────────────────────────────────────────────────────────── */
+
+/* caliptra_buffer 초기화 헬퍼 */
+#define MAKE_TX_BUF(req_ptr) \
+    ((struct caliptra_buffer){ .data = (const uint8_t*)(req_ptr), .len = sizeof(*(req_ptr)) })
+
+#define MAKE_RX_BUF(resp_ptr) \
+    ((struct caliptra_buffer){ .data = (uint8_t*)(resp_ptr), .len = sizeof(*(resp_ptr)) })
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 1: REPORT_HEK_METADATA (0x5248_4D54 "RHMT")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_report_hek_metadata(
+    const ocp_lock_report_hek_metadata_req_t *req,
+    ocp_lock_report_hek_metadata_resp_t      *resp,
+    bool async)
 {
-    if (buf_size < 52) return 0;
-
-    uint32_t off = 0;
-    memcpy(buf + off, mek_ctx->drive_serial, 32);        off += 32;
-    memcpy(buf + off, &mek_ctx->namespace_id, 4);        off += 4;
-    memcpy(buf + off, &mek_ctx->lba_start, 8);           off += 8;
-    memcpy(buf + off, &mek_ctx->lba_count, 8);           off += 8;
-    return off;  /* 52 */
+    struct caliptra_buffer tx = MAKE_TX_BUF(req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_REPORT_HEK_METADATA, &tx, &rx, async);
 }
 
-/* ---------------------------------------------------------------------------
- * 내부 헬퍼: ECDH HPKE KEM (임시 키 생성 포함)
- * generate_ephemeral=1로 설정하여 Caliptra가 임시 키쌍을 내부 생성합니다.
- * --------------------------------------------------------------------------- */
-static caliptra_status_t lock_ecdh_ephemeral(
-    caliptra_ctx_t *ctx,
-    const uint8_t drive_ecdh_pub[CALIPTRA_ECC384_PUBKEY_SIZE],
-    caliptra_key_handle_t *out_ss_handle,
-    uint8_t out_eph_pub[CALIPTRA_ECC384_PUBKEY_SIZE])
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 2: GET_ALGORITHMS (0x4741_4C47 "GALG")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_get_algorithms(
+    ocp_lock_get_algorithms_resp_t *resp,
+    bool async)
 {
-    caliptra_crypto_ecdh_req_t req = { 0 };
-    req.generate_ephemeral = 1;
-    /* private_key_handle는 generate_ephemeral=1일 때 무시됨 */
-    memcpy(req.peer_pub_key, drive_ecdh_pub, CALIPTRA_ECC384_PUBKEY_SIZE);
-    req.chksum = caliptra_mbox_calc_checksum(&req, sizeof(req));
+    ocp_lock_get_algorithms_req_t req = { .hdr = { .chksum = 0 } };
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_GET_ALGORITHMS, &tx, &rx, async);
+}
 
-    caliptra_crypto_ecdh_resp_t resp;
-    uint32_t resp_len = 0;
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 3: INITIALIZE_MEK_SECRET (0x494D_4B53 "IMKS")
+ * ───────────────────────────────────────────────────────────────────── */
 
-    caliptra_mbox_cmd_t cmd = {
-        .cmd             = CALIPTRA_CMD_CRYPTO_ECDH_KEY_AGREE,
-        .req             = &req,
-        .req_len         = sizeof(req),
-        .resp            = &resp,
-        .resp_max_len    = sizeof(resp),
-        .resp_actual_len = &resp_len,
-        .timeout_us      = ctx->mbox_timeout_us,
+int caliptra_lock_initialize_mek_secret(
+    const uint8_t sek[32],
+    const uint8_t dpk[32],
+    ocp_lock_initialize_mek_secret_resp_t *resp,
+    bool async)
+{
+    ocp_lock_initialize_mek_secret_req_t req = { .hdr = { .chksum = 0 }, .reserved = 0 };
+    memcpy(req.sek, sek, 32);
+    memcpy(req.dpk, dpk, 32);
+
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    int ret = caliptra_mailbox_execute(OCP_LOCK_INITIALIZE_MEK_SECRET, &tx, &rx, async);
+
+    /* 보안: 스택의 키 데이터 제로화 */
+    memset(&req, 0, sizeof(req));
+    return ret;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 4: MIX_MPK (0x4D4D_504B "MMPK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_mix_mpk(
+    const ocp_lock_wrapped_key_t *enabled_mpk,
+    ocp_lock_mix_mpk_resp_t      *resp,
+    bool async)
+{
+    ocp_lock_mix_mpk_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(&req.enabled_mpk, enabled_mpk, sizeof(ocp_lock_wrapped_key_t));
+
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_MIX_MPK, &tx, &rx, async);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 5: DERIVE_MEK (0x444D_454B "DMEK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_derive_mek(
+    const uint8_t mek_checksum[16],
+    const uint8_t metadata[OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE],
+    const uint8_t aux_metadata[OCP_LOCK_ENCRYPTION_ENGINE_AUX_SIZE],
+    uint32_t cmd_timeout,
+    ocp_lock_derive_mek_resp_t *resp,
+    bool async)
+{
+    ocp_lock_derive_mek_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.mek_checksum, mek_checksum, 16);
+    memcpy(req.metadata,     metadata,     OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE);
+    memcpy(req.aux_metadata, aux_metadata, OCP_LOCK_ENCRYPTION_ENGINE_AUX_SIZE);
+    req.cmd_timeout = cmd_timeout;
+
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_DERIVE_MEK, &tx, &rx, async);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 6: ENUMERATE_HPKE_HANDLES (0x4548_444C "EHDL")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_enumerate_hpke_handles(
+    ocp_lock_enumerate_hpke_handles_resp_t *resp,
+    bool async)
+{
+    ocp_lock_enumerate_hpke_handles_req_t req = { .hdr = { .chksum = 0 }, .reserved = 0 };
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_ENUMERATE_HPKE_HANDLES, &tx, &rx, async);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 7: ROTATE_HPKE_KEY (0x5248_504B "RHPK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_rotate_hpke_key(
+    uint32_t hpke_handle,
+    ocp_lock_rotate_hpke_key_resp_t *resp,
+    bool async)
+{
+    ocp_lock_rotate_hpke_key_req_t req = {
+        .hdr         = { .chksum = 0 },
+        .reserved    = 0,
+        .hpke_handle = hpke_handle,
     };
-
-    caliptra_status_t st = caliptra_mbox_send(ctx, &cmd);
-    if (st != CALIPTRA_OK) return st;
-
-    memcpy(out_ss_handle, &resp.shared_secret_handle, sizeof(*out_ss_handle));
-    if (out_eph_pub)
-        memcpy(out_eph_pub, resp.eph_pub_key, CALIPTRA_ECC384_PUBKEY_SIZE);
-    return CALIPTRA_OK;
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_ROTATE_HPKE_KEY, &tx, &rx, async);
 }
 
-/* ---------------------------------------------------------------------------
- * 저수준 HPKE API
- * --------------------------------------------------------------------------- */
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 8: GENERATE_MEK (0x474D_454B "GMEK")
+ * ───────────────────────────────────────────────────────────────────── */
 
-caliptra_status_t caliptra_lock_ecdh_encap(
-    caliptra_ctx_t *ctx,
-    const uint8_t drive_ecdh_pub[CALIPTRA_ECC384_PUBKEY_SIZE],
-    caliptra_key_handle_t *out_ss_handle,
-    uint8_t out_eph_pub[CALIPTRA_ECC384_PUBKEY_SIZE])
+int caliptra_lock_generate_mek(
+    ocp_lock_generate_mek_resp_t *resp,
+    bool async)
 {
-    if (!ctx || !ctx->initialized) return CALIPTRA_ERR_NOT_READY;
-    if (!drive_ecdh_pub || !out_ss_handle || !out_eph_pub)
-        return CALIPTRA_ERR_INVALID_PARAM;
-
-    return lock_ecdh_ephemeral(ctx, drive_ecdh_pub, out_ss_handle, out_eph_pub);
+    ocp_lock_generate_mek_req_t req = { .hdr = { .chksum = 0 }, .reserved = 0 };
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_GENERATE_MEK, &tx, &rx, async);
 }
 
-caliptra_status_t caliptra_lock_mlkem_encap(
-    caliptra_ctx_t *ctx,
-    const uint8_t drive_mlkem_pub[CALIPTRA_ML_KEM_1024_PUB_SIZE],
-    uint8_t out_ct[CALIPTRA_ML_KEM_1024_CT_SIZE],
-    caliptra_key_handle_t *out_ss_handle)
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 9: GET_HPKE_PUB_KEY (0x4748_504B "GHPK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_get_hpke_pub_key(
+    uint32_t hpke_handle,
+    ocp_lock_get_hpke_pub_key_resp_t *resp,
+    bool async)
 {
-    if (!ctx || !ctx->initialized) return CALIPTRA_ERR_NOT_READY;
-    if (!drive_mlkem_pub || !out_ct || !out_ss_handle)
-        return CALIPTRA_ERR_INVALID_PARAM;
-
-    return caliptra_crypto_ml_kem_encap(ctx, drive_mlkem_pub, out_ct, out_ss_handle);
-}
-
-caliptra_status_t caliptra_lock_hpke_derive_wrap_key(
-    caliptra_ctx_t *ctx,
-    const caliptra_key_handle_t *ss_handle,
-    const caliptra_lock_mek_context_t *mek_ctx,
-    caliptra_key_handle_t *out_wrap_key_handle)
-{
-    if (!ctx || !ctx->initialized) return CALIPTRA_ERR_NOT_READY;
-    if (!ss_handle || !mek_ctx || !out_wrap_key_handle)
-        return CALIPTRA_ERR_INVALID_PARAM;
-
-    uint8_t info[52];
-    uint32_t info_len = lock_serialize_mek_context(mek_ctx, info, sizeof(info));
-    if (info_len == 0) return CALIPTRA_ERR_INVALID_PARAM;
-
-    /* HKDF-SHA384: IKM=shared_secret, salt=없음, info=mek_context, okm=32바이트(AES-256 키) */
-    return caliptra_crypto_hkdf(ctx, ss_handle,
-                                 NULL, 0,
-                                 info, info_len,
-                                 32,  /* AES-256 = 32바이트 */
-                                 out_wrap_key_handle);
-}
-
-caliptra_status_t caliptra_lock_wrap_mek(
-    caliptra_ctx_t *ctx,
-    const caliptra_key_handle_t *mek_handle,
-    const caliptra_key_handle_t *wrap_key_handle,
-    const uint8_t iv[CALIPTRA_AES_GCM_IV_SIZE],
-    const uint8_t *aad, uint32_t aad_len,
-    uint8_t *out_ct, uint32_t *out_ct_len,
-    uint8_t out_tag[CALIPTRA_AES_GCM_TAG_SIZE])
-{
-    if (!ctx || !ctx->initialized) return CALIPTRA_ERR_NOT_READY;
-    if (!mek_handle || !wrap_key_handle || !iv || !out_ct || !out_ct_len || !out_tag)
-        return CALIPTRA_ERR_INVALID_PARAM;
-
-    /*
-     * AES-GCM encrypt(wrap_key, iv, aad, mek_handle)
-     * MEK는 KV 핸들로 참조되므로 data 필드를 mek_handle의 핸들 값으로 채웁니다.
-     * Caliptra FW는 핸들을 인식하여 실제 MEK를 참조합니다.
-     */
-    caliptra_crypto_aes_req_t req = { 0 };
-    memcpy(&req.key_handle, wrap_key_handle, sizeof(*wrap_key_handle));
-    memcpy(req.iv, iv, CALIPTRA_AES_GCM_IV_SIZE);
-    req.aad_size = aad_len;
-    if (aad && aad_len > 0)
-        memcpy(req.aad, aad, aad_len);
-    /* data 필드에 MEK 핸들 값을 전달 (Caliptra FW가 해석) */
-    memcpy(req.data, mek_handle->handle, CALIPTRA_KEY_HANDLE_SIZE);
-    req.data_size = CALIPTRA_KEY_HANDLE_SIZE;
-    req.chksum = caliptra_mbox_calc_checksum(&req, sizeof(req));
-
-    caliptra_crypto_aes_resp_t resp;
-    uint32_t resp_len = 0;
-
-    caliptra_mbox_cmd_t cmd = {
-        .cmd             = CALIPTRA_CMD_CRYPTO_ENCRYPT_AES,
-        .req             = &req,
-        .req_len         = sizeof(req),
-        .resp            = &resp,
-        .resp_max_len    = sizeof(resp),
-        .resp_actual_len = &resp_len,
-        .timeout_us      = ctx->mbox_timeout_us,
+    ocp_lock_get_hpke_pub_key_req_t req = {
+        .hdr         = { .chksum = 0 },
+        .reserved    = 0,
+        .hpke_handle = hpke_handle,
     };
-
-    caliptra_status_t st = caliptra_mbox_send(ctx, &cmd);
-    if (st != CALIPTRA_OK) return st;
-
-    memcpy(out_ct, resp.data, resp.data_size);
-    *out_ct_len = resp.data_size;
-    memcpy(out_tag, resp.tag, CALIPTRA_AES_GCM_TAG_SIZE);
-    return CALIPTRA_OK;
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_GET_HPKE_PUB_KEY, &tx, &rx, async);
 }
 
-/* ---------------------------------------------------------------------------
- * 고수준 MEK 전달 API
- * --------------------------------------------------------------------------- */
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 10: GENERATE_MPK (0x474D_504B "GMPK")
+ * ───────────────────────────────────────────────────────────────────── */
 
-/*
- * IV 생성 헬퍼: RNG로 12바이트 GCM IV 생성
- */
-static caliptra_status_t lock_gen_iv(caliptra_ctx_t *ctx,
-                                      uint8_t iv[CALIPTRA_AES_GCM_IV_SIZE])
+int caliptra_lock_generate_mpk(
+    const uint8_t                       sek[32],
+    const uint8_t                      *metadata,
+    uint32_t                            metadata_len,
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    ocp_lock_generate_mpk_resp_t       *resp,
+    bool async)
 {
-    return caliptra_crypto_rng(ctx, CALIPTRA_AES_GCM_IV_SIZE, iv);
+    ocp_lock_generate_mpk_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.sek, sek, 32);
+
+    if (metadata && metadata_len > 0 && metadata_len <= OCP_LOCK_WRAPPED_KEY_MAX_METADATA_LEN) {
+        req.metadata_len = metadata_len;
+        memcpy(req.metadata, metadata, metadata_len);
+    }
+
+    memcpy(&req.sealed_access_key, sealed_access_key, sizeof(ocp_lock_sealed_access_key_t));
+
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    int ret = caliptra_mailbox_execute(OCP_LOCK_GENERATE_MPK, &tx, &rx, async);
+
+    memset(&req, 0, sizeof(req));
+    return ret;
 }
 
-/* ---------------------------------------------------------------------------
- * ECDH HPKE MEK 전달
- * --------------------------------------------------------------------------- */
-caliptra_status_t caliptra_lock_deliver_mek_ecdh(
-    caliptra_ctx_t *ctx,
-    const uint8_t drive_ecdh_pub[CALIPTRA_ECC384_PUBKEY_SIZE],
-    const caliptra_key_handle_t *mek_handle,
-    const caliptra_lock_mek_context_t *mek_ctx,
-    caliptra_lock_ecdh_mek_blob_t *out_blob)
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 11: REWRAP_MPK (0x5245_5750 "REWP")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_rewrap_mpk(
+    const uint8_t                       sek[32],
+    const ocp_lock_wrapped_key_t       *current_locked_mpk,
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    const uint8_t                       new_ak_ciphertext[48],
+    ocp_lock_rewrap_mpk_resp_t         *resp,
+    bool async)
 {
-    if (!ctx || !ctx->initialized) return CALIPTRA_ERR_NOT_READY;
-    if (!drive_ecdh_pub || !mek_handle || !mek_ctx || !out_blob)
-        return CALIPTRA_ERR_INVALID_PARAM;
+    ocp_lock_rewrap_mpk_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.sek, sek, 32);
+    memcpy(&req.current_locked_mpk, current_locked_mpk, sizeof(ocp_lock_wrapped_key_t));
+    memcpy(&req.sealed_access_key,  sealed_access_key,  sizeof(ocp_lock_sealed_access_key_t));
+    memcpy(req.new_ak_ciphertext,   new_ak_ciphertext,  48);
 
-    caliptra_status_t st;
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    int ret = caliptra_mailbox_execute(OCP_LOCK_REWRAP_MPK, &tx, &rx, async);
 
-    /* Step 1: ECDH KEM — 임시 키쌍 생성 + 공유 비밀 */
-    caliptra_key_handle_t ss_handle;
-    st = lock_ecdh_ephemeral(ctx, drive_ecdh_pub, &ss_handle, out_blob->eph_pub_key);
-    if (st != CALIPTRA_OK) return st;
-
-    /* Step 2: HKDF — 공유 비밀 → AES 래핑 키 */
-    caliptra_key_handle_t wrap_key;
-    st = caliptra_lock_hpke_derive_wrap_key(ctx, &ss_handle, mek_ctx, &wrap_key);
-    if (st != CALIPTRA_OK) return st;
-
-    /* Step 3: 랜덤 IV 생성 */
-    st = lock_gen_iv(ctx, out_blob->iv);
-    if (st != CALIPTRA_OK) return st;
-
-    /* Step 4: AES-256-GCM — MEK 암호화 */
-    st = caliptra_lock_wrap_mek(ctx, mek_handle, &wrap_key,
-                                  out_blob->iv, NULL, 0,
-                                  out_blob->mek_ct, &out_blob->mek_ct_size,
-                                  out_blob->tag);
-    return st;
+    memset(&req, 0, sizeof(req));
+    return ret;
 }
 
-/* ---------------------------------------------------------------------------
- * ML-KEM HPKE MEK 전달
- * --------------------------------------------------------------------------- */
-caliptra_status_t caliptra_lock_deliver_mek_mlkem(
-    caliptra_ctx_t *ctx,
-    const uint8_t drive_mlkem_pub[CALIPTRA_ML_KEM_1024_PUB_SIZE],
-    const caliptra_key_handle_t *mek_handle,
-    const caliptra_lock_mek_context_t *mek_ctx,
-    caliptra_lock_mlkem_mek_blob_t *out_blob)
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 12: ENABLE_MPK (0x524D_504B "RMPK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_enable_mpk(
+    const uint8_t                       sek[32],
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    const ocp_lock_wrapped_key_t       *locked_mpk,
+    ocp_lock_enable_mpk_resp_t         *resp,
+    bool async)
 {
-    if (!ctx || !ctx->initialized) return CALIPTRA_ERR_NOT_READY;
-    if (!drive_mlkem_pub || !mek_handle || !mek_ctx || !out_blob)
-        return CALIPTRA_ERR_INVALID_PARAM;
+    ocp_lock_enable_mpk_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.sek, sek, 32);
+    memcpy(&req.sealed_access_key, sealed_access_key, sizeof(ocp_lock_sealed_access_key_t));
+    memcpy(&req.locked_mpk,        locked_mpk,        sizeof(ocp_lock_wrapped_key_t));
 
-    caliptra_status_t st;
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    int ret = caliptra_mailbox_execute(OCP_LOCK_ENABLE_MPK, &tx, &rx, async);
 
-    /* Step 1: ML-KEM encap — ciphertext + 공유 비밀 */
-    caliptra_key_handle_t ss_handle;
-    st = caliptra_crypto_ml_kem_encap(ctx, drive_mlkem_pub,
-                                       out_blob->mlkem_ct, &ss_handle);
-    if (st != CALIPTRA_OK) return st;
-
-    /* Step 2: HKDF — 공유 비밀 → AES 래핑 키 */
-    caliptra_key_handle_t wrap_key;
-    st = caliptra_lock_hpke_derive_wrap_key(ctx, &ss_handle, mek_ctx, &wrap_key);
-    if (st != CALIPTRA_OK) return st;
-
-    /* Step 3: 랜덤 IV 생성 */
-    st = lock_gen_iv(ctx, out_blob->iv);
-    if (st != CALIPTRA_OK) return st;
-
-    /* Step 4: AES-256-GCM — MEK 암호화 */
-    st = caliptra_lock_wrap_mek(ctx, mek_handle, &wrap_key,
-                                  out_blob->iv, NULL, 0,
-                                  out_blob->mek_ct, &out_blob->mek_ct_size,
-                                  out_blob->tag);
-    return st;
+    memset(&req, 0, sizeof(req));
+    return ret;
 }
 
-/* ---------------------------------------------------------------------------
- * Hybrid HPKE MEK 전달 (ECDH + ML-KEM)
- * --------------------------------------------------------------------------- */
-caliptra_status_t caliptra_lock_deliver_mek_hybrid(
-    caliptra_ctx_t *ctx,
-    const uint8_t drive_ecdh_pub[CALIPTRA_ECC384_PUBKEY_SIZE],
-    const uint8_t drive_mlkem_pub[CALIPTRA_ML_KEM_1024_PUB_SIZE],
-    const caliptra_key_handle_t *mek_handle,
-    const caliptra_lock_mek_context_t *mek_ctx,
-    caliptra_lock_hybrid_mek_blob_t *out_blob)
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 13: TEST_ACCESS_KEY (0x5441_434B "TACK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_test_access_key(
+    const uint8_t                       sek[32],
+    const uint8_t                       nonce[32],
+    const ocp_lock_wrapped_key_t       *locked_mpk,
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    ocp_lock_test_access_key_resp_t    *resp,
+    bool async)
 {
-    if (!ctx || !ctx->initialized) return CALIPTRA_ERR_NOT_READY;
-    if (!drive_ecdh_pub || !drive_mlkem_pub || !mek_handle || !mek_ctx || !out_blob)
-        return CALIPTRA_ERR_INVALID_PARAM;
+    ocp_lock_test_access_key_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.sek,   sek,   32);
+    memcpy(req.nonce, nonce, 32);
+    memcpy(&req.locked_mpk,       locked_mpk,       sizeof(ocp_lock_wrapped_key_t));
+    memcpy(&req.sealed_access_key, sealed_access_key, sizeof(ocp_lock_sealed_access_key_t));
 
-    caliptra_status_t st;
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    int ret = caliptra_mailbox_execute(OCP_LOCK_TEST_ACCESS_KEY, &tx, &rx, async);
 
-    /* Step 1a: ECDH KEM */
-    caliptra_key_handle_t ss_ecdh;
-    st = lock_ecdh_ephemeral(ctx, drive_ecdh_pub, &ss_ecdh, out_blob->eph_pub_key);
-    if (st != CALIPTRA_OK) return st;
+    memset(&req, 0, sizeof(req));
+    return ret;
+}
 
-    /* Step 1b: ML-KEM encap */
-    caliptra_key_handle_t ss_mlkem;
-    st = caliptra_crypto_ml_kem_encap(ctx, drive_mlkem_pub,
-                                       out_blob->mlkem_ct, &ss_mlkem);
-    if (st != CALIPTRA_OK) return st;
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 14: GET_STATUS (0x4753_5441 "GSTA")
+ * ───────────────────────────────────────────────────────────────────── */
 
-    /*
-     * Step 2: Hybrid HKDF — concat(ss_ecdh, ss_mlkem) → wrap_key
-     *
-     * HKDF info = mek_context || "hybrid"
-     * Caliptra FW에서 두 핸들을 결합하는 방식은 구현 의존적입니다.
-     * 여기서는 ss_ecdh 핸들을 IKM으로, ss_mlkem 핸들 값을 salt로 사용합니다.
-     */
-    uint8_t info[52 + 8];
-    uint32_t info_len = lock_serialize_mek_context(mek_ctx, info, 52);
-    /* 하이브리드 레이블 추가 */
-    const char label[] = "hybrid";
-    memcpy(info + info_len, label, 6);
-    info_len += 6;
+int caliptra_lock_get_status(
+    ocp_lock_get_status_resp_t *resp,
+    bool async)
+{
+    ocp_lock_get_status_req_t req = { .hdr = { .chksum = 0 } };
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_GET_STATUS, &tx, &rx, async);
+}
 
-    caliptra_key_handle_t wrap_key;
-    st = caliptra_crypto_hkdf(ctx, &ss_ecdh,
-                               ss_mlkem.handle, CALIPTRA_KEY_HANDLE_SIZE, /* salt = ml-kem ss handle */
-                               info, info_len,
-                               32,
-                               &wrap_key);
-    if (st != CALIPTRA_OK) return st;
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 15: CLEAR_KEY_CACHE (0x434C_4B43 "CLKC")
+ * ───────────────────────────────────────────────────────────────────── */
 
-    /* Step 3: 랜덤 IV 생성 */
-    st = lock_gen_iv(ctx, out_blob->iv);
-    if (st != CALIPTRA_OK) return st;
+int caliptra_lock_clear_key_cache(
+    uint32_t cmd_timeout,
+    ocp_lock_clear_key_cache_resp_t *resp,
+    bool async)
+{
+    ocp_lock_clear_key_cache_req_t req = {
+        .hdr         = { .chksum = 0 },
+        .reserved    = 0,
+        .cmd_timeout = cmd_timeout,
+    };
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_CLEAR_KEY_CACHE, &tx, &rx, async);
+}
 
-    /* Step 4: AES-256-GCM — MEK 암호화 */
-    st = caliptra_lock_wrap_mek(ctx, mek_handle, &wrap_key,
-                                  out_blob->iv, NULL, 0,
-                                  out_blob->mek_ct, &out_blob->mek_ct_size,
-                                  out_blob->tag);
-    return st;
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 16: UNLOAD_MEK (0x554D_454B "UMEK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_unload_mek(
+    const uint8_t metadata[OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE],
+    uint32_t cmd_timeout,
+    ocp_lock_unload_mek_resp_t *resp,
+    bool async)
+{
+    ocp_lock_unload_mek_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.metadata, metadata, OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE);
+    req.cmd_timeout = cmd_timeout;
+
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_UNLOAD_MEK, &tx, &rx, async);
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 커맨드 17: LOAD_MEK (0x4C4D_454B "LMEK")
+ * ───────────────────────────────────────────────────────────────────── */
+
+int caliptra_lock_load_mek(
+    const uint8_t                  metadata[OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE],
+    const uint8_t                  aux_metadata[OCP_LOCK_ENCRYPTION_ENGINE_AUX_SIZE],
+    const ocp_lock_wrapped_key_t  *wrapped_mek,
+    uint32_t cmd_timeout,
+    ocp_lock_load_mek_resp_t      *resp,
+    bool async)
+{
+    ocp_lock_load_mek_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.metadata,     metadata,     OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE);
+    memcpy(req.aux_metadata, aux_metadata, OCP_LOCK_ENCRYPTION_ENGINE_AUX_SIZE);
+    memcpy(&req.wrapped_mek, wrapped_mek,  sizeof(ocp_lock_wrapped_key_t));
+    req.cmd_timeout = cmd_timeout;
+
+    struct caliptra_buffer tx = MAKE_TX_BUF(&req);
+    struct caliptra_buffer rx = MAKE_RX_BUF(resp);
+    return caliptra_mailbox_execute(OCP_LOCK_LOAD_MEK, &tx, &rx, async);
 }

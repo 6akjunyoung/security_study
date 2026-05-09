@@ -1,413 +1,448 @@
+// Licensed under the Apache-2.0 license
+
 /*
  * Caliptra 2.x SoC 통합 예제
  *
- * 이 파일은 Passive 모드 SoC ROM/FMC에서 Caliptra를 초기화하고
- * 부트 시퀀스에서 측정값을 stash하는 전형적인 흐름을 보여줍니다.
+ * 실제 libcaliptra API (caliptra-sw/libcaliptra/inc/caliptra_api.h) 를 사용하는
+ * 전형적인 SoC 부팅 및 Runtime 커맨드 흐름을 보여줍니다.
  *
- * 실제 SoC에서는 아래 플랫폼 HAL 함수들을 구현해야 합니다.
+ * 빌드 include 경로:
+ *   -I caliptra-sw/libcaliptra/inc
+ *   -I caliptra-sw/registers/generated-src
+ *   -I caliptra_project/include
+ *
+ * 링크:
+ *   caliptra-sw/libcaliptra/src/caliptra_api.c
+ *   caliptra_project/src/caliptra_driver.c   (HAL — 플랫폼별 구현 필요)
+ *   caliptra_project/src/caliptra_lock.c     (OCP LOCK 래퍼)
  */
 
-#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
-#include <stdarg.h>
-#include "../include/caliptra_driver.h"
-#include "../include/caliptra_regs.h"
+#include <stdio.h>
 
-/* ===========================================================================
- * [구현 필요] 플랫폼별 HAL 구현
- * =========================================================================== */
+/* libcaliptra 공개 API */
+#include "caliptra_api.h"
+#include "caliptra_types.h"
+#include "caliptra_enums.h"
 
-/* SoC의 실제 Caliptra MMIO 베이스 주소 (통합 시 설정) */
-#define MY_CALIPTRA_BASE_ADDR  0x10000000UL
+/* 프로젝트 HAL 및 OCP LOCK */
+#include "caliptra_driver.h"
+#include "caliptra_lock.h"
 
-static uint32_t platform_reg_read(uint32_t offset)
-{
-    volatile uint32_t *addr = (volatile uint32_t *)(MY_CALIPTRA_BASE_ADDR + offset);
-    return *addr;
-}
-
-static void platform_reg_write(uint32_t offset, uint32_t value)
-{
-    volatile uint32_t *addr = (volatile uint32_t *)(MY_CALIPTRA_BASE_ADDR + offset);
-    *addr = value;
-}
-
-static bool platform_is_ready_for_fuse(void)
-{
-    /* SoC 플랫폼의 ready_for_fuse 신호 (GPIO, 레지스터 폴링 등) */
-    return false;  /* 구현 필요 */
-}
-
-static bool platform_is_ready_for_fw(void)
-{
-    return false;  /* 구현 필요 */
-}
-
-static bool platform_is_ready_for_rtflows(void)
-{
-    return false;  /* 구현 필요 */
-}
-
-static bool platform_is_error_fatal(void)
-{
-    return false;  /* 구현 필요: cptra_error_fatal 신호 읽기 */
-}
-
-static bool platform_is_error_non_fatal(void)
-{
-    return false;  /* 구현 필요 */
-}
-
-static void platform_delay_us(uint32_t us)
-{
-    /* SoC 타이머 기반 딜레이 구현 */
-    volatile uint32_t dummy = us * 100;
-    while (dummy--) { /* busy wait placeholder */ }
-}
-
-static void platform_log(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
-}
-
-/* HAL 구현체 */
-static const caliptra_hw_ops_t g_caliptra_ops = {
-    .reg_read             = platform_reg_read,
-    .reg_write            = platform_reg_write,
-    .is_ready_for_fuse    = platform_is_ready_for_fuse,
-    .is_ready_for_fw      = platform_is_ready_for_fw,
-    .is_ready_for_rtflows = platform_is_ready_for_rtflows,
-    .is_error_fatal       = platform_is_error_fatal,
-    .is_error_non_fatal   = platform_is_error_non_fatal,
-    .delay_us             = platform_delay_us,
-    .log                  = platform_log,
-};
-
-/* ===========================================================================
- * 예제: Fuse 데이터 (실제 프로젝트에서는 안전한 소스에서 로드)
- * =========================================================================== */
-
-static caliptra_fuse_t g_fuse_data = {
-    /* UDS Seed: 실제 값은 제조 시 프로그래밍 (난독화된 512 bit)
-     * 예시: 모두 0 (개발/테스트용 debug UDS) */
-    .uds_seed = { 0 },
-
-    /* Field Entropy: 소유자가 현장에서 프로그래밍 */
-    .field_entropy = { 0 },
-
-    /* Vendor PK Hash: Caliptra FW 서명 검증용 공개키 SHA384 해시 */
-    .vendor_pk_hash = {
-        /* SHA384 of vendor ECC P384 + ML-DSA public keys */
-        0x00000000, 0x00000000, 0x00000000, 0x00000000,
-        0x00000000, 0x00000000, 0x00000000, 0x00000000,
-        0x00000000, 0x00000000, 0x00000000, 0x00000000,
-    },
-
-    .ecc_revocation = 0,   /* 폐기된 ECC 키 없음 */
-    .lms_revocation = 0,   /* 폐기된 LMS 키 없음 */
-    .mldsa_revocation = 0, /* 폐기된 ML-DSA 키 없음 */
-
-    .runtime_svn = { 1, 0, 0, 0 },  /* SVN = 1 (one-hot, bit 0) */
-    .anti_rollback_disable = 0,      /* Anti-rollback 활성화 */
-
-    .life_cycle = 0x03,  /* Production */
-    .pqc_key_type = CPTRA_FUSE_PQC_KEY_TYPE_MLDSA,  /* ML-DSA 사용 */
-
-    .soc_stepping_id = 0x0001,
-};
-
-/* ===========================================================================
- * 예제 1: Passive 모드 Cold Boot 시퀀스
- * SoC ROM에서 호출
- * =========================================================================== */
-
-/*
- * 외부 FW 이미지 로드 함수 (플랫폼별 구현 필요)
- * 예: Flash, NVME, 네트워크 등에서 Caliptra FW 바이너리 로드
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 1: 완전한 부팅 시퀀스
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * 이 함수는 SoC ROM/FMC에서 Caliptra를 초기화하는 표준 흐름입니다.
+ *
+ * WARNING: caliptra_init_fuses()는 시뮬레이션 전용입니다.
+ *          실 제품에서는 HW 상태 머신이 Fuse를 프로그래밍합니다.
  */
-extern int platform_load_caliptra_fw(uint8_t **fw_buf, uint32_t *fw_size);
-extern void platform_free_fw_buf(uint8_t *fw_buf);
+int example_boot_sequence(const uint8_t *fw_image, uint32_t fw_size)
+{
+    int ret;
 
-/*
- * SoC FMC 해시 계산 (SoC 플랫폼별 구현)
- * SHA384(SoC FMC 바이너리)를 계산하여 반환
+    /* 단계 1: 플랫폼 HAL 초기화 (SoC별 APB 주소 설정) */
+    ret = caliptra_platform_init(0x10000000); /* SoC APB 베이스 주소 */
+    if (ret != 0) {
+        printf("HAL init failed: %d\n", ret);
+        return ret;
+    }
+
+    /* 단계 2: Fuse 준비 대기 */
+    if (!caliptra_ready_for_fuses()) {
+        printf("Caliptra not ready for fuses\n");
+        return -1;
+    }
+
+    /* 단계 3: Fuse 프로그래밍 (시뮬레이션 전용)
+     * 실 제품: 이 단계는 HW 상태 머신이 수행 */
+    struct caliptra_fuses fuses = {
+        .uds_seed         = { /* 48바이트 UDS (0으로 초기화 — 실제는 HSM에서 주입) */ },
+        .field_entropy    = { /* 32바이트 Field Entropy */ },
+        .vendor_pk_hash   = { /* Vendor ECC/MLDSA 공개키 해시 */ },
+        .ecc_revocation   = 0,
+        .owner_pk_hash    = { /* Owner 공개키 해시 */ },
+        .fw_svn           = { 0 },
+        .anti_rollback_disable = false,
+        .life_cycle       = Manufacturing,
+        .lms_revocation   = 0,
+        .mldsa_revocation = 0,
+        .fuse_pqc_key_type = 0,
+        .soc_stepping_id  = 0,
+    };
+
+    ret = caliptra_init_fuses(&fuses);
+    if (ret != NO_ERROR) {
+        printf("Fuse init failed: %d\n", ret);
+        return ret;
+    }
+
+    /* 단계 4: BootFSM 시작 */
+    ret = caliptra_bootfsm_go();
+    if (ret != NO_ERROR) {
+        printf("BootFSM go failed: %d\n", ret);
+        return ret;
+    }
+
+    /* 단계 5: FW 업로드 준비 대기 */
+    ret = (int)caliptra_ready_for_firmware();
+    if (ret != NO_ERROR) {
+        printf("Caliptra FW upload error: 0x%08X\n",
+               caliptra_read_fw_fatal_error());
+        return ret;
+    }
+
+    /* 단계 6: FW 업로드 */
+    struct caliptra_buffer fw_buf = {
+        .data = fw_image,
+        .len  = fw_size,
+    };
+
+    ret = caliptra_upload_fw(&fw_buf, false /* 동기 */);
+    if (ret != NO_ERROR) {
+        printf("FW upload failed: %d\n", ret);
+        return ret;
+    }
+
+    /* 단계 7: Runtime 준비 대기 */
+    ret = (int)caliptra_ready_for_runtime();
+    if (ret != NO_ERROR) {
+        printf("Caliptra runtime error: 0x%08X\n",
+               caliptra_read_fw_fatal_error());
+        return ret;
+    }
+
+    printf("Caliptra boot complete\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 2: 측정값 Stash (Boot Flow)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * SoC ROM에서 부팅 중 측정값을 Caliptra에 Stash합니다.
+ * 최대 8개의 측정값을 저장할 수 있습니다.
  */
-extern int platform_hash_soc_fmc(uint8_t *hash_out_48bytes);
-
-int caliptra_cold_boot_sequence(void)
+int example_stash_measurement(const uint8_t *component_hash, uint32_t pcr_index)
 {
-    caliptra_ctx_t ctx;
-    caliptra_status_t st;
+    struct caliptra_stash_measurement_req req = {
+        .hdr           = { .chksum = 0 },
+        .metadata      = { 0 },  /* SoC별 측정 컨텍스트 */
+        .measurement   = { 0 },  /* 48바이트 SHA384 해시 */
+        .context       = { 0 },
+        .svn           = 0,
+    };
+    memcpy(req.measurement, component_hash, 48);
 
-    printf("[Boot] Caliptra initialization start\n");
+    struct caliptra_stash_measurement_resp resp = {0};
 
-    /* 드라이버 초기화 (10초 타임아웃) */
-    st = caliptra_driver_init(&ctx, &g_caliptra_ops, 10 * 1000 * 1000);
-    if (st != CALIPTRA_OK) {
-        printf("[Boot] ERROR: driver init failed (%d)\n", st);
-        return -1;
+    int ret = caliptra_stash_measurement(&req, &resp, false);
+    if (ret != NO_ERROR) {
+        printf("Stash measurement failed: %d\n", ret);
     }
-
-    /* 1. Fuse 쓰기 준비 대기 */
-    printf("[Boot] Waiting for fuse ready...\n");
-    st = caliptra_wait_for_fuse_ready(&ctx);
-    if (st != CALIPTRA_OK) {
-        printf("[Boot] ERROR: fuse ready timeout (%d)\n", st);
-        return -1;
-    }
-
-    /* 2. Fuse 레지스터 프로그래밍 + FUSE_WR_DONE */
-    printf("[Boot] Programming fuses...\n");
-    st = caliptra_program_fuses(&ctx, &g_fuse_data);
-    if (st != CALIPTRA_OK) {
-        printf("[Boot] ERROR: fuse programming failed (%d)\n", st);
-        return -1;
-    }
-
-    /* 3. FW 로드 준비 대기 (Passive 모드) */
-    printf("[Boot] Waiting for firmware ready signal...\n");
-    st = caliptra_wait_for_fw_ready(&ctx);
-    if (st != CALIPTRA_OK) {
-        printf("[Boot] ERROR: fw ready timeout (%d)\n", st);
-        return -1;
-    }
-
-    /* 4. Caliptra FW 이미지 로드 */
-    uint8_t *fw_buf = NULL;
-    uint32_t fw_size = 0;
-    if (platform_load_caliptra_fw(&fw_buf, &fw_size) != 0) {
-        printf("[Boot] ERROR: failed to load Caliptra FW\n");
-        return -1;
-    }
-
-    printf("[Boot] Loading Caliptra FW (%u bytes)...\n", fw_size);
-    st = caliptra_load_firmware(&ctx, fw_buf, fw_size);
-    platform_free_fw_buf(fw_buf);
-
-    if (st != CALIPTRA_OK) {
-        printf("[Boot] ERROR: FW load failed (%d)\n", st);
-        return -1;
-    }
-
-    /* 5. Runtime 준비 대기 */
-    printf("[Boot] Waiting for runtime ready...\n");
-    st = caliptra_wait_for_rt_ready(&ctx);
-    if (st != CALIPTRA_OK) {
-        printf("[Boot] ERROR: RT ready timeout (%d)\n", st);
-        return -1;
-    }
-
-    printf("[Boot] Caliptra runtime ready!\n");
-
-    /* 6. SoC FMC 측정값 Stash */
-    uint8_t soc_fmc_hash[CALIPTRA_SHA384_HASH_SIZE] = { 0 };
-    if (platform_hash_soc_fmc(soc_fmc_hash) == 0) {
-        caliptra_stash_measurement_req_t meas_req = { 0 };
-        meas_req.metadata[0] = 'F';
-        meas_req.metadata[1] = 'M';
-        meas_req.metadata[2] = 'C';
-        meas_req.metadata[3] = '0';
-        memcpy(meas_req.measurement, soc_fmc_hash, CALIPTRA_SHA384_HASH_SIZE);
-        meas_req.svn = 1;
-
-        st = caliptra_stash_measurement(&ctx, &meas_req);
-        if (st != CALIPTRA_OK)
-            printf("[Boot] WARNING: stash measurement failed (%d)\n", st);
-        else
-            printf("[Boot] SoC FMC measurement stashed\n");
-    }
-
-    return 0;
+    return ret;
 }
 
-/* ===========================================================================
- * 예제 2: Runtime에서 증명(Attestation) 수집
- * SoC 런타임 펌웨어에서 호출
- * =========================================================================== */
-
-int caliptra_collect_attestation(caliptra_ctx_t *ctx)
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 3: 인증서 획득 (ECC384 + MLDSA87 이중 지원)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * Caliptra 2.x는 ECC384와 MLDSA87 두 가지 서명 알고리즘을 지원합니다.
+ * 각 인증서 API는 _ecc384_ 또는 _mldsa87_ 변형으로 제공됩니다.
+ */
+int example_get_certificates(void)
 {
-    caliptra_status_t st;
+    int ret;
 
-    /* IDevID 인증서 획득 */
-    static uint8_t idevid_cert[CALIPTRA_CERT_MAX_SIZE];
-    uint32_t idevid_cert_size = sizeof(idevid_cert);
-
-    st = caliptra_get_idevid_cert(ctx, idevid_cert, &idevid_cert_size);
-    if (st != CALIPTRA_OK) {
-        printf("[RT] ERROR: get IDevID cert failed (%d)\n", st);
-        return -1;
-    }
-    printf("[RT] IDevID cert: %u bytes\n", idevid_cert_size);
-
-    /* RT Alias 인증서 획득 */
-    static uint8_t rt_alias_cert[CALIPTRA_CERT_MAX_SIZE];
-    uint32_t rt_cert_size = sizeof(rt_alias_cert);
-
-    st = caliptra_get_rt_alias_cert(ctx, rt_alias_cert, &rt_cert_size);
-    if (st != CALIPTRA_OK) {
-        printf("[RT] ERROR: get RT Alias cert failed (%d)\n", st);
-        return -1;
-    }
-    printf("[RT] RT Alias cert: %u bytes\n", rt_cert_size);
-
-    /* PCR Quote 생성 (freshness nonce 포함) */
-    static uint8_t nonce[32];
-    /* 실제 사용 시 검증자에서 받은 nonce 사용 */
-    for (int i = 0; i < 32; i++) nonce[i] = (uint8_t)i;
-
-    static uint8_t pcr_quote[CALIPTRA_PCR_QUOTE_MAX_SIZE];
-    uint32_t quote_size = sizeof(pcr_quote);
-
-    st = caliptra_get_pcr_quote(ctx, nonce, pcr_quote, &quote_size);
-    if (st != CALIPTRA_OK) {
-        printf("[RT] WARNING: get PCR quote failed (%d)\n", st);
-    } else {
-        printf("[RT] PCR quote: %u bytes\n", quote_size);
+    /* IDevID ECC384 인증서 */
+    struct caliptra_get_idev_ecc384_cert_resp ecc_idev_resp = {0};
+    struct caliptra_get_idev_ecc384_cert_req  ecc_idev_req  = { .hdr = { .chksum = 0 } };
+    ret = caliptra_get_idev_ecc384_cert(&ecc_idev_req, &ecc_idev_resp, false);
+    if (ret == NO_ERROR) {
+        printf("IDevID ECC384 cert size: %u bytes\n", ecc_idev_resp.cert_size);
     }
 
-    /* 원격 검증자에게 전송 (플랫폼별 구현) */
-    /* send_attestation_to_verifier(idevid_cert, rt_alias_cert, pcr_quote, ...); */
+    /* IDevID MLDSA87 인증서 (양자 내성) */
+    struct caliptra_get_idev_mldsa87_cert_resp mldsa_idev_resp = {0};
+    struct caliptra_get_idev_mldsa87_cert_req  mldsa_idev_req  = { .hdr = { .chksum = 0 } };
+    ret = caliptra_get_idev_mldsa87_cert(&mldsa_idev_req, &mldsa_idev_resp, false);
+    if (ret == NO_ERROR) {
+        printf("IDevID MLDSA87 cert size: %u bytes\n", mldsa_idev_resp.cert_size);
+    }
 
-    return 0;
+    /* LDevID ECC384 인증서 */
+    struct caliptra_get_ldev_ecc384_cert_resp ldev_resp = {0};
+    ret = caliptra_get_ldev_ecc384_cert(&ldev_resp, false);
+    if (ret == NO_ERROR) {
+        printf("LDevID ECC384 cert size: %u bytes\n", ldev_resp.cert_size);
+    }
+
+    /* FMC Alias 인증서 */
+    struct caliptra_get_fmc_alias_ecc384_cert_resp fmc_resp = {0};
+    ret = caliptra_get_fmc_alias_ecc384_cert(&fmc_resp, false);
+    if (ret == NO_ERROR) {
+        printf("FMC Alias ECC384 cert size: %u bytes\n", fmc_resp.cert_size);
+    }
+
+    /* RT Alias 인증서 */
+    struct caliptra_get_rt_alias_ecc384_cert_resp rt_resp = {0};
+    ret = caliptra_get_rt_alias_ecc384_cert(&rt_resp, false);
+    if (ret == NO_ERROR) {
+        printf("RT Alias ECC384 cert size: %u bytes\n", rt_resp.cert_size);
+    }
+
+    return NO_ERROR;
 }
 
-/* ===========================================================================
- * 예제 3: SPDM을 위한 DPE 서명 오라클
- * =========================================================================== */
-
-int caliptra_spdm_sign_example(caliptra_ctx_t *ctx,
-                                const uint8_t *challenge_hash,
-                                uint8_t *sig_r_out,
-                                uint8_t *sig_s_out)
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 4: PCR Quote (서명된 증명)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * PCR 값에 대한 서명된 Quote를 요청합니다.
+ * ECC384와 MLDSA87 두 가지 버전이 있습니다.
+ */
+int example_quote_pcrs(const uint8_t *nonce_32bytes)
 {
-    /* DPE Sign 커맨드를 통해 RT Alias Key로 서명 */
-    /* DPE 커맨드 직렬화는 TCG DPE Profile 스펙 참조 */
+    struct caliptra_quote_pcrs_req req = {
+        .hdr   = { .chksum = 0 },
+        .nonce = { 0 },
+    };
+    memcpy(req.nonce, nonce_32bytes, sizeof(req.nonce));
 
-    /* 간단화된 예시: DPE Sign 요청 구조 */
-    typedef struct {
-        uint32_t command_id;     /* 0x0000000A = Sign */
-        uint32_t context_handle[8];
-        uint8_t  label[48];
-        uint8_t  is_symmetric;
-        uint8_t  to_sign[48];   /* 서명할 해시 */
-    } dpe_sign_req_t;
+    /* ECC384 Quote */
+    struct caliptra_quote_pcrs_ecc384_resp ecc_resp = {0};
+    int ret = caliptra_quote_pcrs_ecc384(&req, &ecc_resp, false);
+    if (ret == NO_ERROR) {
+        printf("PCR ECC384 Quote obtained\n");
+    }
 
-    dpe_sign_req_t dpe_req = { 0 };
-    dpe_req.command_id = 0x0000000A;  /* DPE Sign command ID */
-    memcpy(dpe_req.to_sign, challenge_hash, 48);
+    /* MLDSA87 Quote (양자 내성) */
+    struct caliptra_quote_pcrs_mldsa87_resp mldsa_resp = {0};
+    ret = caliptra_quote_pcrs_mldsa87(&req, &mldsa_resp, false);
+    if (ret == NO_ERROR) {
+        printf("PCR MLDSA87 Quote obtained\n");
+    }
 
-    static uint8_t dpe_resp_buf[512];
-    uint32_t resp_size = sizeof(dpe_resp_buf);
+    return ret;
+}
 
-    caliptra_status_t st = caliptra_invoke_dpe(ctx,
-                                                (const uint8_t *)&dpe_req,
-                                                sizeof(dpe_req),
-                                                dpe_resp_buf,
-                                                &resp_size);
-    if (st != CALIPTRA_OK) {
-        printf("[SPDM] DPE sign failed (%d)\n", st);
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 5: Authorization Manifest + Authorize and Stash
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * SoC이 이미지를 로드하기 전 Caliptra에 인증을 요청합니다.
+ */
+int example_authorize_image(
+    const uint8_t *manifest_data, uint32_t manifest_size,
+    const uint8_t *fw_id, const uint8_t *image_hash_48bytes,
+    uint32_t image_size)
+{
+    int ret;
+
+    /* Authorization Manifest 설정 */
+    struct caliptra_set_auth_manifest_req auth_req;
+    memset(&auth_req, 0, sizeof(auth_req));
+    if (manifest_size <= sizeof(auth_req.manifest)) {
+        auth_req.manifest_size = manifest_size;
+        memcpy(auth_req.manifest, manifest_data, manifest_size);
+    }
+
+    ret = caliptra_set_auth_manifest(&auth_req, false);
+    if (ret != NO_ERROR) {
+        printf("Set auth manifest failed: %d\n", ret);
+        return ret;
+    }
+
+    /* 이미지 인증 및 측정값 Stash */
+    struct caliptra_authorize_and_stash_req stash_req;
+    memset(&stash_req, 0, sizeof(stash_req));
+    memcpy(stash_req.fw_id,       fw_id,            sizeof(stash_req.fw_id));
+    memcpy(stash_req.measurement, image_hash_48bytes, 48);
+    stash_req.svn        = 0;
+    stash_req.flags      = 0; /* SKIP_STASH = 0x1 이면 stash 생략 */
+    stash_req.source     = IN_REQUEST;
+    stash_req.image_size = image_size;
+
+    struct caliptra_authorize_and_stash_resp stash_resp = {0};
+    ret = caliptra_authorize_and_stash(&stash_req, &stash_resp, false);
+    if (ret != NO_ERROR) {
+        printf("Authorize and stash failed: %d\n", ret);
+        return ret;
+    }
+
+    if (stash_resp.auth_req_result == AUTHORIZE_IMAGE) {
+        printf("Image authorized\n");
+    } else if (stash_resp.auth_req_result == IMAGE_NOT_AUTHORIZED) {
+        printf("Image NOT authorized\n");
+        return -1;
+    } else if (stash_resp.auth_req_result == IMAGE_HASH_MISMATCH) {
+        printf("Image hash mismatch\n");
         return -1;
     }
 
-    /* DPE 응답에서 서명 추출 (프로토콜 파싱 필요) */
-    /* ... */
-    (void)sig_r_out;
-    (void)sig_s_out;
-
-    printf("[SPDM] DPE sign succeeded (%u bytes response)\n", resp_size);
-    return 0;
+    return NO_ERROR;
 }
 
-/* ===========================================================================
- * 예제 4: PCR 확장 (Runtime 중 추가 측정)
- * =========================================================================== */
-
-int caliptra_runtime_measure_example(caliptra_ctx_t *ctx)
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 6: DPE 커맨드 (DICE Protection Environment)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * DPE는 DICE 키 파생 및 인증서 발급 서비스입니다.
+ * ECC384와 MLDSA87 두 가지 변형이 있습니다.
+ */
+int example_dpe_derive_context(void)
 {
-    /* 예: PCR4에 SoC 구성 파라미터 측정값 확장 */
-    uint8_t soc_config_hash[CALIPTRA_SHA384_HASH_SIZE];
-    /* 플랫폼별 SHA384 계산 */
-    memset(soc_config_hash, 0xAB, CALIPTRA_SHA384_HASH_SIZE);  /* 예시값 */
+    /* DPE DERIVE_CONTEXT 커맨드 구성 */
+    struct caliptra_invoke_dpe_req req = {0};
 
-    caliptra_status_t st = caliptra_extend_pcr(ctx, 4, soc_config_hash);
-    if (st != CALIPTRA_OK) {
-        printf("[RT] ERROR: PCR4 extend failed (%d)\n", st);
+    /* DPE 커맨드 헤더 (TLV 직렬화) */
+    /* dpe_command 필드에 DPE 바이너리 직렬화 데이터를 채웁니다 */
+    /* 실제 DPE 직렬화 형식은 caliptra-sw/dpe/README.md 참조 */
+
+    struct caliptra_invoke_dpe_resp resp = {0};
+
+    /* ECC384 DPE 커맨드 */
+    int ret = caliptra_invoke_dpe_command(&req, &resp, false);
+    if (ret == NO_ERROR) {
+        printf("DPE ECC384 command success\n");
+    }
+
+    /* MLDSA87 DPE 커맨드 (양자 내성) */
+    struct caliptra_invoke_dpe_mldsa87_req mldsa_req = {0};
+    struct caliptra_invoke_dpe_resp mldsa_resp = {0};
+    ret = caliptra_invoke_dpe_mldsa87_command(&mldsa_req, &mldsa_resp, false);
+
+    return ret;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 7: OCP L.O.C.K. MEK 전달 (GENERATE_MEK 방법)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * 새 MEK를 생성하고 SSD 암호화 엔진에 로드하는 전체 흐름입니다.
+ * MEK plaintext는 SoC FW에 절대 노출되지 않습니다.
+ */
+int example_lock_generate_and_load_mek(void)
+{
+    int ret;
+
+    /* 단계 1: 지원 알고리즘 확인 */
+    ocp_lock_get_algorithms_resp_t alg_resp = {0};
+    ret = caliptra_lock_get_algorithms(&alg_resp, false);
+    if (ret != NO_ERROR) {
+        printf("GET_ALGORITHMS failed: %d\n", ret);
+        return ret;
+    }
+    printf("HPKE algorithms: 0x%08X\n", alg_resp.hpke_algorithms);
+
+    /* 단계 2: HPKE 핸들 열거 */
+    ocp_lock_enumerate_hpke_handles_resp_t enum_resp = {0};
+    ret = caliptra_lock_enumerate_hpke_handles(&enum_resp, false);
+    if (ret != NO_ERROR || enum_resp.hpke_handle_count == 0) {
+        printf("No HPKE handles available\n");
         return -1;
     }
-    printf("[RT] PCR4 extended with SoC config measurement\n");
+    uint32_t hpke_handle = enum_resp.hpke_handles[0].handle;
 
-    /* 예: PCR5에 OS 이미지 측정값 확장 */
-    uint8_t os_hash[CALIPTRA_SHA384_HASH_SIZE];
-    memset(os_hash, 0xCD, CALIPTRA_SHA384_HASH_SIZE);  /* 예시값 */
-
-    st = caliptra_extend_pcr(ctx, 5, os_hash);
-    if (st != CALIPTRA_OK) {
-        printf("[RT] ERROR: PCR5 extend failed (%d)\n", st);
-        return -1;
+    /* 단계 3: HPKE 공개키 획득 (SSD에 전달) */
+    ocp_lock_get_hpke_pub_key_resp_t pubkey_resp = {0};
+    ret = caliptra_lock_get_hpke_pub_key(hpke_handle, &pubkey_resp, false);
+    if (ret != NO_ERROR) {
+        printf("GET_HPKE_PUB_KEY failed: %d\n", ret);
+        return ret;
     }
-    printf("[RT] PCR5 extended with OS measurement\n");
+    printf("HPKE pub key len: %u\n", pubkey_resp.pub_key_len);
+    /* 이 공개키를 NVMe Key Programming 커맨드로 SSD에 전달합니다 */
 
-    return 0;
-}
+    /* 단계 4: 새 MEK 생성 */
+    ocp_lock_generate_mek_resp_t gen_resp = {0};
+    ret = caliptra_lock_generate_mek(&gen_resp, false);
+    if (ret != NO_ERROR) {
+        printf("GENERATE_MEK failed: %d\n", ret);
+        return ret;
+    }
+    printf("MEK generated (wrapped)\n");
 
-/* ===========================================================================
- * 예제 5: Fatal 오류 처리 인터럽트 핸들러 패턴
- * =========================================================================== */
+    /* 단계 5: MEK를 암호화 엔진에 로드 */
+    uint8_t metadata[OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE]  = {0};
+    uint8_t aux_metadata[OCP_LOCK_ENCRYPTION_ENGINE_AUX_SIZE]   = {0};
+    /* metadata/aux_metadata는 SSD 컨트롤러가 요구하는 컨텍스트 정보 */
 
-static caliptra_ctx_t g_ctx;  /* 전역 컨텍스트 (인터럽트 핸들러에서 접근) */
-
-void cptra_error_fatal_isr(void)
-{
-    /* 인터럽트 서비스 루틴 */
-    caliptra_handle_fatal_error(&g_ctx);
-
-    /* Caliptra 리셋 (플랫폼별 구현) */
-    /* platform_assert_cptra_rst_b();
-     * platform_delay_us(10);
-     * platform_deassert_cptra_rst_b(); */
-}
-
-void cptra_error_non_fatal_isr(void)
-{
-    caliptra_handle_non_fatal_error(&g_ctx);
-}
-
-/* ===========================================================================
- * 메인 예제 진입점
- * =========================================================================== */
-
-int main(void)
-{
-    printf("=== Caliptra 2.x SoC Integration Example ===\n\n");
-
-    /* Cold boot 시퀀스 */
-    if (caliptra_cold_boot_sequence() != 0) {
-        printf("ERROR: Cold boot sequence failed\n");
-        return 1;
+    ocp_lock_load_mek_resp_t load_resp = {0};
+    ret = caliptra_lock_load_mek(
+        metadata, aux_metadata, &gen_resp.wrapped_mek,
+        5000 /* 5초 타임아웃 */, &load_resp, false);
+    if (ret != NO_ERROR) {
+        printf("LOAD_MEK failed: %d\n", ret);
+        return ret;
     }
 
-    /* 이후 Runtime 사용 예시 */
-    caliptra_ctx_t rt_ctx;
-    caliptra_driver_init(&rt_ctx, &g_caliptra_ops, 5 * 1000 * 1000);
+    printf("MEK loaded to encryption engine\n");
+    return NO_ERROR;
+}
 
-    /* Runtime 측정값 확장 */
-    caliptra_runtime_measure_example(&rt_ctx);
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 8: FIPS 버전 및 자체 테스트
+ * ─────────────────────────────────────────────────────────────────────
+ */
+int example_fips(void)
+{
+    /* FIPS 버전 조회 */
+    struct caliptra_fips_version_resp ver_resp = {0};
+    int ret = caliptra_fips_version(&ver_resp, false);
+    if (ret == NO_ERROR) {
+        printf("FIPS mode: 0x%08X, FIPS version: %u.%u.%u\n",
+               ver_resp.mode,
+               ver_resp.fips_rev[0], ver_resp.fips_rev[1], ver_resp.fips_rev[2]);
+    }
 
-    /* Attestation 수집 */
-    caliptra_collect_attestation(&rt_ctx);
+    /* FIPS 자체 테스트 */
+    ret = caliptra_self_test_start(false);
+    if (ret == NO_ERROR) {
+        printf("FIPS self test started\n");
+    }
 
-    /* 버전 확인 */
-    uint32_t version = 0;
-    if (caliptra_get_version(&rt_ctx, &version) == CALIPTRA_OK)
-        printf("[RT] Caliptra FW version: %d.%d.%d\n",
-               (version >> 24) & 0xFF,
-               (version >> 16) & 0xFF,
-               version & 0xFFFF);
+    /* 자체 테스트 결과 확인 */
+    ret = caliptra_self_test_get_results(false);
+    if (ret == NO_ERROR) {
+        printf("FIPS self test passed\n");
+    }
 
-    printf("\n=== Example complete ===\n");
-    return 0;
+    return ret;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 예제 9: 비동기 메일박스 사용
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * async=true로 커맨드를 발행한 후 완료를 폴링합니다.
+ */
+int example_async_fw_info(void)
+{
+    struct caliptra_fw_info_resp resp = {0};
+
+    /* 비동기로 커맨드 발행 */
+    int ret = caliptra_fw_info(&resp, true /* async */);
+    if (ret != NO_ERROR) {
+        printf("fw_info async issue failed: %d\n", ret);
+        return ret;
+    }
+
+    /* 완료 폴링 */
+    while (!caliptra_test_for_completion()) {
+        caliptra_wait(); /* HAL 구현에 따라 yield/nop */
+    }
+
+    /* 응답 수집 */
+    ret = caliptra_complete();
+    if (ret == NO_ERROR) {
+        printf("FW Info: ECC aliases=%u, MLDSA aliases=%u\n",
+               resp.attestation_disabled,
+               resp.attestation_disabled);
+    }
+
+    return ret;
 }

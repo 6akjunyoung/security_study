@@ -1,3 +1,6 @@
 [submodule "caliptra_project/Caliptra"]
 	path = caliptra_project/Caliptra
 	url = git@github.com:chipsalliance/Caliptra.git
+[submodule "caliptra_project/caliptra-sw"]
+	path = caliptra_project/caliptra-sw
+	url = git@github.com:chipsalliance/caliptra-sw.git

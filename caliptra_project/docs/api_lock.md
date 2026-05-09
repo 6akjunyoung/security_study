@@ -1,362 +1,243 @@
-# OCP L.O.C.K. API (2.1+)
+# OCP L.O.C.K. API (Caliptra 2.1+)
 
-> **관련 파일**
-> - `include/caliptra_lock.h` — MEK 전달 API (고수준/저수준), MEK 블랍 구조체
-> - `include/caliptra_crypto_ext.h` — 하위 암호화 서비스 (ECDH, ML-KEM, HKDF, AES-GCM)
-> - `include/caliptra_types.h` — `CALIPTRA_ECC384_PUBKEY_SIZE`, `CALIPTRA_ML_KEM_1024_*`
+> 레퍼런스:
+> - `caliptra_project/include/caliptra_lock.h` — SoC API
+> - `caliptra_project/include/caliptra_lock_types.h` — C 구조체
+> - `caliptra-sw/api/src/mailbox.rs` — Rust 커맨드 코드 및 구조체 (정식 소스)
+> - `caliptra-sw/runtime/src/ocp_lock/` — Runtime FW 구현
+> - OCP_LOCK_Specification_v1.0_RC2.pdf — 프로토콜 스펙
 
----
+## 개요
 
-## 1. 개요
+OCP L.O.C.K.은 SSD MEK(Media Encryption Key) 보안 전달 프로토콜입니다.
 
-**OCP L.O.C.K. (Layered Open Composable Key management)** 는 SoC Host가 SSD(NVMe 드라이브)에
-MEK(Media Encryption Key)를 **안전하게 전달**하기 위한 OCP 표준 프로토콜입니다.
+**핵심 원칙:**
+- Caliptra가 MEK를 생성/파생/봉인합니다
+- MEK plaintext는 SoC FW에 절대 노출되지 않습니다
+- HPKE를 통해 암호화된 MEK만 SSD에 전달됩니다
+- Customer가 MPK(Managed Platform Key)로 MEK 접근을 제어합니다
 
-### 핵심 보안 속성
-
-- SoC FW는 MEK의 **plaintext 값을 절대 보지 못합니다**.
-- MEK는 Caliptra 내부 KV에서 파생되어, HPKE(Hybrid Public Key Encryption)로 암호화된 블랍 형태로만 SSD에 전달됩니다.
-- 공격자가 SoC 메모리를 덤프해도 MEK를 복원할 수 없습니다.
-- Caliptra 2.1+ 필요 (`pqc_key_type`, `hek_ratchet_seed` Fuse 기록 포함).
-
----
-
-## 2. 키 계층 구조
+## 키 계층
 
 ```
-[Fuse] HEK_RATCHET_SEED (256-bit)
-    │  HKDF (Caliptra boot-time, FW 내부 자동 실행)
+[Fuse] UDS/HEK_RATCHET_SEED
+    │  (부팅 시 Caliptra ROM 내부에서 파생)
     ▼
-[KV]  HEK  (Host Encryption Key, SoC FW 불가시)
-    │  HKDF + (drive_serial[32], namespace_id)
+HEK (Host Encryption Key) — Caliptra 내부, FW 비가시
+    │  + drive_serial
     ▼
-[KV]  MDK  (MEK Derivation Key, per-drive)
-    │  HKDF + (namespace_id, lba_start, lba_count)
+MDK (MEK Derivation Key) — 드라이브별
+    │  + namespace_id + lba_range
     ▼
-[KV]  MEK  (Media Encryption Key, AES-256-XTS)
-              ↓ HPKE 암호화 후
-         [blob] → SSD (NVMe Key Programming)
+MEK (Media Encryption Key) — SSD 암호화 엔진에 로드
 ```
 
-각 키 파생 단계는 **Caliptra FW 내부**에서 자동으로 수행됩니다.
-SoC FW는 `caliptra_lock_deliver_mek_*()` 호출 시 **MEK 핸들**을 전달하고,
-암호화된 **MEK 블랍**을 돌려받습니다.
+## HPKE 지원 알고리즘
 
----
+| 알고리즘 | 플래그 | 설명 |
+|----------|--------|------|
+| ECDH-P384 + HKDF-SHA384 + AES-256-GCM | bit 0 | 표준 |
+| ML-KEM-1024 + HKDF-SHA384 + AES-256-GCM | bit 1 | 양자 내성 |
+| 하이브리드 (ECDH + ML-KEM) | bit 2 | 고전+양자 동시 보호 |
 
-## 3. HPKE 모드 비교
+## 커맨드 코드 (caliptra-sw/api/src/mailbox.rs)
 
-| 모드 | KEM 알고리즘 | 전체 구성 | 보안 수준 | 권장 여부 |
-|---|---|---|---|---|
-| **ECDH** | DHKEM P-384 (RFC 9180) | ECDH + HKDF + AES-256-GCM | 128-bit (고전) | 고전 환경 |
-| **ML-KEM** | ML-KEM-1024 (FIPS 203) | ML-KEM + HKDF + AES-256-GCM | 256-bit (양자 내성) | **양자 위협 대비** |
-| **Hybrid** | ECDH + ML-KEM | 두 KEM 결합 + HKDF + AES-256-GCM | 고전 + 양자 동시 보장 | **최고 보안** |
+| 커맨드 | 코드 | ASCII | 설명 |
+|--------|------|-------|------|
+| `REPORT_HEK_METADATA` | 0x5248_4D54 | "RHMT" | HEK 메타데이터 조회 |
+| `GET_ALGORITHMS` | 0x4741_4C47 | "GALG" | 지원 알고리즘 조회 |
+| `INITIALIZE_MEK_SECRET` | 0x494D_4B53 | "IMKS" | MEK 파생 세션 초기화 |
+| `MIX_MPK` | 0x4D4D_504B | "MMPK" | Customer MPK 혼합 |
+| `DERIVE_MEK` | 0x444D_454B | "DMEK" | MEK 파생 |
+| `ENUMERATE_HPKE_HANDLES` | 0x4548_444C | "EHDL" | HPKE 핸들 목록 조회 |
+| `ROTATE_HPKE_KEY` | 0x5248_504B | "RHPK" | HPKE 키 교체 |
+| `GENERATE_MEK` | 0x474D_454B | "GMEK" | 새 MEK 생성 |
+| `GET_HPKE_PUB_KEY` | 0x4748_504B | "GHPK" | HPKE 공개키 획득 |
+| `GENERATE_MPK` | 0x474D_504B | "GMPK" | MPK 생성 |
+| `REWRAP_MPK` | 0x5245_5750 | "REWP" | MPK 재봉인 |
+| `ENABLE_MPK` | 0x524D_504B | "RMPK" | MPK 활성화 |
+| `TEST_ACCESS_KEY` | 0x5441_434B | "TACK" | Access Key 검증 |
+| `GET_STATUS` | 0x4753_5441 | "GSTA" | 상태 조회 |
+| `CLEAR_KEY_CACHE` | 0x434C_4B43 | "CLKC" | 키 캐시 무효화 |
+| `UNLOAD_MEK` | 0x554D_454B | "UMEK" | MEK 언로드 |
+| `LOAD_MEK` | 0x4C4D_454B | "LMEK" | MEK 로드 |
 
-> **권장**: 새로운 SoC 설계에서는 **Hybrid 모드**를 기본값으로 사용하세요.
-> 고전 컴퓨터와 양자 컴퓨터 모두에 대한 보안을 동시에 보장합니다.
-
----
-
-## 4. SoC 통합 체크리스트
-
-### 제조 단계 (공장에서만)
-- [ ] **`hek_ratchet_seed[8]`** Fuse 기록 (256-bit, HSM에서 생성). 이후 변경 불가.
-- [ ] `pqc_key_type` Fuse: ML-KEM 지원 설정 (`bit0 = 1`).
-- [ ] `life_cycle` Fuse: `CALIPTRA_LC_PRODUCTION` 설정.
-
-### 하드웨어 설계 단계
-- [ ] **`OCP_LOCK_ENABLE`** strap 설정 (PCB 레벨).
-- [ ] NVMe 인터페이스: Identify 커맨드로 DPK(Drive Public Key) 수집 지원.
-- [ ] NVMe Key Programming 커맨드 구현.
-
-### SoC FW 구현
-- [ ] Cold boot 완료 후 `caliptra_wait_for_rt_ready()` 확인.
-- [ ] NVMe Identify로 드라이브 공개키(DPK) 수집.
-- [ ] MEK 컨텍스트 설정: `drive_serial`, `namespace_id`, `lba_start/count`.
-- [ ] `caliptra_lock_deliver_mek_*()` 호출 → MEK 블랍 획득.
-- [ ] NVMe Key Programming 커맨드로 MEK 블랍 전달.
-- [ ] MEK 블랍을 SoC 메모리에 장기 보존하지 않도록 설계.
-
----
-
-## 5. 코드 예시 — ML-KEM HPKE (양자 내성 권장)
+## API 함수
 
 ```c
-#include "caliptra_lock.h"
-#include <string.h>
+// 1. HEK 메타데이터 조회
+int caliptra_lock_report_hek_metadata(
+    const ocp_lock_report_hek_metadata_req_t *req,
+    ocp_lock_report_hek_metadata_resp_t      *resp, bool async);
 
-caliptra_status_t setup_drive_encryption_mlkem(
-    caliptra_ctx_t *ctx,
-    nvme_drive_t   *drive,
-    uint32_t        nsid)
-{
-    caliptra_status_t st;
+// 2. 지원 알고리즘 조회
+int caliptra_lock_get_algorithms(
+    ocp_lock_get_algorithms_resp_t *resp, bool async);
 
-    /* ──────────────────────────────────────────────
-     * 1단계: NVMe Identify로 드라이브 ML-KEM 공개키 수집
-     *   - SSD는 NVMe Identify 응답에 DPK(Drive Public Key) 포함
-     *   - ML-KEM-1024 공개키: 1568바이트
-     * ────────────────────────────────────────────── */
-    uint8_t drive_mlkem_pub[CALIPTRA_ML_KEM_1024_PUB_SIZE]; /* 1568B */
-    st = nvme_get_drive_mlkem_pub_key(drive, drive_mlkem_pub);
-    if (st != 0) return CALIPTRA_ERR_INVALID_PARAM;
+// 3. MEK 파생 세션 초기화
+int caliptra_lock_initialize_mek_secret(
+    const uint8_t sek[32], const uint8_t dpk[32],
+    ocp_lock_initialize_mek_secret_resp_t *resp, bool async);
 
-    /* ──────────────────────────────────────────────
-     * 2단계: MEK 컨텍스트 설정
-     *   - drive_serial: HPKE 바인딩 (재생 공격 방지)
-     *   - namespace_id, lba_range: 암호화 범위 바인딩
-     * ────────────────────────────────────────────── */
-    caliptra_lock_mek_context_t mek_ctx;
-    memset(&mek_ctx, 0, sizeof(mek_ctx));
+// 4. Customer MPK 혼합
+int caliptra_lock_mix_mpk(
+    const ocp_lock_wrapped_key_t *enabled_mpk,
+    ocp_lock_mix_mpk_resp_t *resp, bool async);
 
-    nvme_get_drive_serial(drive, mek_ctx.drive_serial); /* 최대 32바이트 */
-    mek_ctx.namespace_id = nsid;
-    mek_ctx.lba_start    = 0;
-    mek_ctx.lba_count    = 0;  /* 0 = 전체 네임스페이스 */
+// 5. MEK 파생
+int caliptra_lock_derive_mek(
+    const uint8_t mek_checksum[16],
+    const uint8_t metadata[20], const uint8_t aux_metadata[32],
+    uint32_t cmd_timeout,
+    ocp_lock_derive_mek_resp_t *resp, bool async);
 
-    /* ──────────────────────────────────────────────
-     * 3단계: MEK 핸들 획득
-     *   - Caliptra FW가 HEK → MDK → MEK 파생 후 핸들 반환
-     *   - SoC FW는 MEK 원시 값 접근 불가
-     * ────────────────────────────────────────────── */
-    caliptra_key_handle_t mek_handle;
-    st = caliptra_get_mek_handle(ctx, &mek_ctx, &mek_handle);
-    if (st != CALIPTRA_OK) return st;
+// 6. HPKE 핸들 목록 조회
+int caliptra_lock_enumerate_hpke_handles(
+    ocp_lock_enumerate_hpke_handles_resp_t *resp, bool async);
 
-    /* ──────────────────────────────────────────────
-     * 4단계: ML-KEM HPKE MEK 전달 (원스텝)
-     *   내부적으로:
-     *     1. ML-KEM-ENCAP(drive_mlkem_pub) → (mlkem_ct, ss)
-     *     2. HKDF(ss, mek_ctx) → wrap_key
-     *     3. AES-256-GCM(mek_handle, wrap_key) → encrypted_mek
-     * ────────────────────────────────────────────── */
-    caliptra_lock_mlkem_mek_blob_t blob;
-    st = caliptra_lock_deliver_mek_mlkem(
-        ctx,
-        drive_mlkem_pub,
-        &mek_handle,
-        &mek_ctx,
-        &blob);
-    if (st != CALIPTRA_OK) return st;
+// 7. HPKE 키 교체
+int caliptra_lock_rotate_hpke_key(
+    uint32_t hpke_handle,
+    ocp_lock_rotate_hpke_key_resp_t *resp, bool async);
 
-    /* ──────────────────────────────────────────────
-     * 5단계: SSD에 MEK 블랍 전달
-     *   - NVMe Key Programming 커맨드 사용
-     *   - SSD가 자신의 ML-KEM 개인키로 복호화하여 MEK 획득
-     * ────────────────────────────────────────────── */
-    st = nvme_key_program(drive, nsid, &blob, sizeof(blob));
-    if (st != 0) return CALIPTRA_ERR_CMD_FAILURE;
+// 8. 새 MEK 생성
+int caliptra_lock_generate_mek(
+    ocp_lock_generate_mek_resp_t *resp, bool async);
 
-    return CALIPTRA_OK;
-}
+// 9. HPKE 공개키 획득
+int caliptra_lock_get_hpke_pub_key(
+    uint32_t hpke_handle,
+    ocp_lock_get_hpke_pub_key_resp_t *resp, bool async);
+
+// 10. MPK 생성
+int caliptra_lock_generate_mpk(
+    const uint8_t sek[32],
+    const uint8_t *metadata, uint32_t metadata_len,
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    ocp_lock_generate_mpk_resp_t *resp, bool async);
+
+// 11. MPK 재봉인 (Access Key 교체)
+int caliptra_lock_rewrap_mpk(
+    const uint8_t sek[32],
+    const ocp_lock_wrapped_key_t *current_locked_mpk,
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    const uint8_t new_ak_ciphertext[48],
+    ocp_lock_rewrap_mpk_resp_t *resp, bool async);
+
+// 12. MPK 활성화 (Locked → Enabled)
+int caliptra_lock_enable_mpk(
+    const uint8_t sek[32],
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    const ocp_lock_wrapped_key_t *locked_mpk,
+    ocp_lock_enable_mpk_resp_t *resp, bool async);
+
+// 13. Access Key 검증
+int caliptra_lock_test_access_key(
+    const uint8_t sek[32], const uint8_t nonce[32],
+    const ocp_lock_wrapped_key_t *locked_mpk,
+    const ocp_lock_sealed_access_key_t *sealed_access_key,
+    ocp_lock_test_access_key_resp_t *resp, bool async);
+
+// 14. 상태 조회
+int caliptra_lock_get_status(
+    ocp_lock_get_status_resp_t *resp, bool async);
+
+// 15. 키 캐시 무효화
+int caliptra_lock_clear_key_cache(
+    uint32_t cmd_timeout,
+    ocp_lock_clear_key_cache_resp_t *resp, bool async);
+
+// 16. MEK 언로드
+int caliptra_lock_unload_mek(
+    const uint8_t metadata[20], uint32_t cmd_timeout,
+    ocp_lock_unload_mek_resp_t *resp, bool async);
+
+// 17. MEK 로드
+int caliptra_lock_load_mek(
+    const uint8_t metadata[20], const uint8_t aux_metadata[32],
+    const ocp_lock_wrapped_key_t *wrapped_mek, uint32_t cmd_timeout,
+    ocp_lock_load_mek_resp_t *resp, bool async);
 ```
 
----
+## MEK 전달 시퀀스
 
-## 6. 코드 예시 — Hybrid HPKE (최고 보안)
+### 방법 A: GENERATE_MEK (새 MEK 생성)
 
-ECDH와 ML-KEM 두 KEM을 동시에 사용하여, 고전 컴퓨터와 양자 컴퓨터 모두에 대한 보안을 보장합니다.
+```
+1. GET_ALGORITHMS    → 지원 알고리즘 확인
+2. ENUMERATE_HPKE_HANDLES → 핸들 번호 확인
+3. GET_HPKE_PUB_KEY  → Caliptra HPKE 공개키 획득 → SSD에 전달
+4. GENERATE_MEK      → 새 MEK 생성 (WrappedKey 반환)
+5. GENERATE_MPK      → Customer Access Key 포함 MPK 생성 [선택]
+6. ENABLE_MPK        → MPK 활성화 [선택]
+7. LOAD_MEK          → 암호화 엔진에 MEK 로드
+```
+
+### 방법 B: DERIVE_MEK (HEK에서 파생)
+
+```
+1. INITIALIZE_MEK_SECRET(SEK, DPK) → 파생 세션 초기화
+2. MIX_MPK(enabled_mpk)            → Customer MPK 혼합 [선택]
+3. DERIVE_MEK(metadata)            → MEK 파생
+4. LOAD_MEK(wrapped_mek)           → 암호화 엔진에 MEK 로드
+```
+
+### 드라이브 잠금/슬립
+
+```
+UNLOAD_MEK → 암호화 엔진에서 MEK 제거
+CLEAR_KEY_CACHE → 내부 키 캐시 초기화 [선택]
+```
+
+## 주요 상수
+
+| 상수 | 값 | 설명 |
+|------|----|------|
+| `OCP_LOCK_MAX_HPKE_HANDLES` | 3 | 최대 HPKE 핸들 수 |
+| `OCP_LOCK_MAX_HPKE_PUBKEY_LEN` | 1665 | HPKE 공개키 최대 크기 (ML-KEM-1024 기준) |
+| `OCP_LOCK_WRAPPED_KEY_MAX_METADATA_LEN` | 32 | WrappedKey 메타데이터 최대 크기 |
+| `OCP_LOCK_WRAPPED_KEY_MAX_INFO_LEN` | 256 | SealedAccessKey info 최대 크기 |
+| `OCP_LOCK_MAX_ENC_LEN` | 1665 | KEM ciphertext 최대 크기 |
+| `OCP_LOCK_ENCRYPTION_ENGINE_METADATA_SIZE` | 20 | 암호화 엔진 메타데이터 크기 |
+| `OCP_LOCK_ENCRYPTION_ENGINE_AUX_SIZE` | 32 | 보조 메타데이터 크기 |
+
+## 주요 구조체
+
+### WrappedKey (암호화된 키 컨테이너)
 
 ```c
-#include "caliptra_lock.h"
-
-caliptra_status_t setup_drive_encryption_hybrid(
-    caliptra_ctx_t *ctx,
-    nvme_drive_t   *drive,
-    uint32_t        nsid)
-{
-    /* ECDH + ML-KEM 공개키 모두 수집 (NVMe Identify) */
-    uint8_t drive_ecdh_pub[CALIPTRA_ECC384_PUBKEY_SIZE];    /* 96B, X+Y */
-    uint8_t drive_mlkem_pub[CALIPTRA_ML_KEM_1024_PUB_SIZE]; /* 1568B */
-
-    nvme_get_drive_ecdh_pub_key(drive, drive_ecdh_pub);
-    nvme_get_drive_mlkem_pub_key(drive, drive_mlkem_pub);
-
-    /* MEK 컨텍스트 및 핸들 설정 */
-    caliptra_lock_mek_context_t mek_ctx;
-    memset(&mek_ctx, 0, sizeof(mek_ctx));
-    nvme_get_drive_serial(drive, mek_ctx.drive_serial);
-    mek_ctx.namespace_id = nsid;
-
-    caliptra_key_handle_t mek_handle;
-    caliptra_get_mek_handle(ctx, &mek_ctx, &mek_handle);
-
-    /* Hybrid HPKE 원스텝:
-     *   1. ECDH(임시키, drive_ecdh_pub) → (ss_ecdh, eph_pub)
-     *   2. ML-KEM-ENCAP(drive_mlkem_pub) → (mlkem_ct, ss_mlkem)
-     *   3. HKDF(ss_ecdh || ss_mlkem, mek_ctx) → wrap_key
-     *   4. AES-256-GCM(mek_handle, wrap_key) → encrypted_mek
-     */
-    caliptra_lock_hybrid_mek_blob_t blob;
-    caliptra_status_t st = caliptra_lock_deliver_mek_hybrid(
-        ctx,
-        drive_ecdh_pub,
-        drive_mlkem_pub,
-        &mek_handle,
-        &mek_ctx,
-        &blob);
-    if (st != CALIPTRA_OK) return st;
-
-    /* SSD에 Hybrid MEK 블랍 전달 */
-    return nvme_key_program(drive, nsid, &blob, sizeof(blob));
-}
+typedef struct {
+    uint16_t key_type;   // 0x01=LockedMpk, 0x02=EnabledMpk, 0x03=WrappedMek
+    uint16_t reserved;
+    uint8_t  salt[12];
+    uint32_t metadata_len;
+    uint32_t key_len;
+    uint8_t  iv[12];
+    uint8_t  metadata[32];
+    uint8_t  ciphertext_and_auth_tag[80]; // AES-256-GCM 암호문 + 16B 태그
+} ocp_lock_wrapped_key_t;
 ```
 
----
-
-## 7. MEK 블랍 구조체 상세
-
-SSD로 전달되는 MEK 블랍은 모드에 따라 구조가 다릅니다.
-
-### `caliptra_lock_ecdh_mek_blob_t` (ECDH HPKE)
-
-| 필드 | 크기 | 설명 |
-|---|---|---|
-| `eph_pub_key[96]` | 96 B | Caliptra 생성 임시 P-384 공개키. SSD가 ECDH 복원에 사용. |
-| `iv[12]` | 12 B | AES-256-GCM IV. TRNG로 생성. |
-| `tag[16]` | 16 B | AES-256-GCM 인증 태그. |
-| `mek_ct_size` | 4 B | 암호화된 MEK 크기. |
-| `mek_ct[]` | 가변 | 암호화된 MEK (AES-256-XTS 키, 64B). |
-
-### `caliptra_lock_mlkem_mek_blob_t` (ML-KEM HPKE)
-
-| 필드 | 크기 | 설명 |
-|---|---|---|
-| `mlkem_ct[1568]` | 1568 B | ML-KEM-1024 암호문. SSD의 ML-KEM 개인키로 복호화. |
-| `iv[12]` | 12 B | AES-256-GCM IV. |
-| `tag[16]` | 16 B | AES-256-GCM 인증 태그. |
-| `mek_ct_size` | 4 B | 암호화된 MEK 크기. |
-| `mek_ct[]` | 가변 | 암호화된 MEK. |
-
-### `caliptra_lock_hybrid_mek_blob_t` (Hybrid HPKE)
-
-| 필드 | 크기 | 설명 |
-|---|---|---|
-| `eph_pub_key[96]` | 96 B | ECDH 임시 공개키. |
-| `mlkem_ct[1568]` | 1568 B | ML-KEM-1024 암호문. |
-| `iv[12]` | 12 B | AES-256-GCM IV. |
-| `tag[16]` | 16 B | AES-256-GCM 인증 태그. |
-| `mek_ct_size` | 4 B | 암호화된 MEK 크기. |
-| `mek_ct[]` | 가변 | 암호화된 MEK. |
-
----
-
-## 8. 저수준 API 단계별 설명 (고급 사용자)
-
-고수준 `caliptra_lock_deliver_mek_*()` 대신 단계별로 제어해야 할 경우 사용합니다.
-예: 부분 실패 복구, 커스텀 AAD, 여러 네임스페이스 일괄 처리 등.
-
-### ML-KEM 저수준 4단계
+### SealedAccessKey (HPKE 봉인 Access Key)
 
 ```c
-#include "caliptra_lock.h"
-
-caliptra_status_t deliver_mek_mlkem_lowlevel(
-    caliptra_ctx_t               *ctx,
-    const uint8_t                 drive_mlkem_pub[1568],
-    const caliptra_key_handle_t  *mek_handle,
-    const caliptra_lock_mek_context_t *mek_ctx,
-    caliptra_lock_mlkem_mek_blob_t    *blob)
-{
-    caliptra_status_t     st;
-    caliptra_key_handle_t ss_handle;
-    caliptra_key_handle_t wrap_key_handle;
-
-    /* ── 단계 1: ML-KEM 캡슐화 ─────────────────────
-     *   drive_mlkem_pub로 공유 비밀 생성
-     *   mlkem_ct: SSD에 전달할 암호문
-     * ─────────────────────────────────────────────── */
-    st = caliptra_lock_mlkem_encap(ctx,
-                                    drive_mlkem_pub,
-                                    blob->mlkem_ct,    /* 출력: 1568B */
-                                    &ss_handle);       /* 출력: 공유 비밀 핸들 */
-    if (st != CALIPTRA_OK) return st;
-
-    /* ── 단계 2: 래핑 키 파생 ─────────────────────
-     *   HKDF(ss_handle, mek_context) → AES-256 래핑 키
-     * ─────────────────────────────────────────────── */
-    st = caliptra_lock_hpke_derive_wrap_key(ctx,
-                                             &ss_handle,
-                                             mek_ctx,
-                                             &wrap_key_handle);
-    if (st != CALIPTRA_OK) return st;
-
-    /* ── 단계 3: IV 생성 (TRNG) ─────────────────── */
-    st = caliptra_crypto_rng(ctx, CALIPTRA_AES_GCM_IV_SIZE, blob->iv);
-    if (st != CALIPTRA_OK) return st;
-
-    /* ── 단계 4: MEK 래핑 (AES-256-GCM) ─────────
-     *   mek_handle: MEK KV 핸들 (plaintext 불가시)
-     *   wrap_key_handle: 래핑 키 KV 핸들
-     *   출력: encrypted_mek + tag
-     * ─────────────────────────────────────────────── */
-    const uint8_t *aad     = (const uint8_t *)mek_ctx;
-    uint32_t       aad_len = sizeof(caliptra_lock_mek_context_t);
-
-    st = caliptra_lock_wrap_mek(ctx,
-                                 mek_handle,
-                                 &wrap_key_handle,
-                                 blob->iv,
-                                 aad, aad_len,
-                                 blob->mek_ct, &blob->mek_ct_size,
-                                 blob->tag);
-    return st;
-}
+typedef struct {
+    ocp_lock_hpke_handle_t hpke_handle;
+    uint32_t               access_key_len;
+    uint32_t               info_len;
+    uint8_t                info[256];
+    uint8_t                kem_ciphertext[1665]; // HPKE KEM 암호문
+    uint8_t                _padding[3];
+    uint8_t                ak_ciphertext[48];    // AES-GCM 암호화 Access Key
+} ocp_lock_sealed_access_key_t;
 ```
 
-### ECDH 저수준 4단계
+## SoC 책임
 
-```c
-caliptra_status_t deliver_mek_ecdh_lowlevel(
-    caliptra_ctx_t                *ctx,
-    const uint8_t                  drive_ecdh_pub[96],
-    const caliptra_key_handle_t   *mek_handle,
-    const caliptra_lock_mek_context_t *mek_ctx,
-    caliptra_lock_ecdh_mek_blob_t *blob)
-{
-    caliptra_key_handle_t ss_handle;
-    caliptra_key_handle_t wrap_key_handle;
-    caliptra_status_t     st;
+1. **Fuse 설정**: HEK 관련 Fuse 프로그래밍 (제조 단계, HW 상태 머신)
+2. **SSD 공개키 수집**: NVMe Identify 커맨드로 SSD HPKE 공개키 획득
+3. **HPKE 세션 조정**: Caliptra HPKE 공개키를 SSD에 전달
+4. **MEK 로드 트리거**: `LOAD_MEK` 호출로 SSD 암호화 엔진 활성화
+5. **보안 이벤트 처리**: `UNLOAD_MEK`, `CLEAR_KEY_CACHE`로 드라이브 잠금
 
-    /* 단계 1: ECDH 캡슐화 (임시키 내부 생성 포함) */
-    st = caliptra_lock_ecdh_encap(ctx,
-                                   drive_ecdh_pub,
-                                   &ss_handle,       /* 공유 비밀 핸들 */
-                                   blob->eph_pub_key); /* 임시 공개키 출력 */
-    if (st != CALIPTRA_OK) return st;
-
-    /* 단계 2: 래핑 키 파생 */
-    st = caliptra_lock_hpke_derive_wrap_key(ctx, &ss_handle, mek_ctx, &wrap_key_handle);
-    if (st != CALIPTRA_OK) return st;
-
-    /* 단계 3: IV 생성 */
-    caliptra_crypto_rng(ctx, CALIPTRA_AES_GCM_IV_SIZE, blob->iv);
-
-    /* 단계 4: MEK 래핑 */
-    const uint8_t *aad = (const uint8_t *)mek_ctx;
-    return caliptra_lock_wrap_mek(ctx, mek_handle, &wrap_key_handle,
-                                   blob->iv, aad, sizeof(*mek_ctx),
-                                   blob->mek_ct, &blob->mek_ct_size, blob->tag);
-}
-```
-
----
-
-## 9. 전체 플로우 요약
-
-```
-SoC FW                    Caliptra (내부)                  SSD
-  │                            │                            │
-  │ ── nvme_identify ──────────────────────────────────▶   │
-  │ ◀──────────────────── DPK(drive_pub_key) ────────────  │
-  │                            │                            │
-  │ ── deliver_mek_*() ──────▶ │                           │
-  │                       MEK 파생 (KV 내부)               │
-  │                       HPKE 암호화 (KV 내부)            │
-  │ ◀────────────── MEK 블랍 반환 ─                        │
-  │                            │                            │
-  │ ── nvme_key_program ───────────────────────────────▶   │
-  │                            │         MEK 블랍 수신      │
-  │                            │         HPKE 복호화        │
-  │                            │         MEK 적용 (AES-XTS)│
-```
+SoC FW는 MEK plaintext를 절대 처리하지 않습니다.
