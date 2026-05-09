@@ -7,6 +7,9 @@
 build/
 out/
 
+# Rust
+target/
+
 # IDE
 .vscode/
 .idea/
