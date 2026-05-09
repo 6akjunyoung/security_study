@@ -29,7 +29,7 @@ git submodule update --init
 
 ## caliptra_comms — mailbox 통신 테스트
 
-`caliptra-hw-model`을 사용해 Caliptra를 in-process로 부팅하고 mailbox 명령을 테스트하는 Rust 바이너리.
+`caliptra-hw-model`을 사용해 Caliptra를 in-process로 부팅하고 카테고리별로 분류된 mailbox 명령을 테스트하는 Rust 바이너리.
 
 ### 사전 준비
 
@@ -52,15 +52,28 @@ cargo build
 
 기본값: `ROM_PATH=/tmp/caliptra-rom-with-log.bin`, `FW_PATH=/tmp/caliptra-fw.bin`
 
-### 테스트 명령
+### 소스 구조
 
-| # | 명령 | cmd ID | 설명 |
-|---|------|--------|------|
-| 1 | FIPS_VERSION | `0x46505652` | FIPS 버전 및 모드 조회 |
-| 2 | FW_INFO | `0x494E464F` | 펌웨어 SVN, revision, PQC 타입 |
-| 3 | GET_LDEV_ECC384_CERT | `0x4C444556` | LDevID ECC384 DER 인증서 |
-| 4 | GET_FMC_ALIAS_ECC384_CERT | `0x43455246` | FMC Alias ECC384 DER 인증서 |
-| 5 | GET_RT_ALIAS_ECC384_CERT | `0x43455252` | RT Alias ECC384 DER 인증서 |
+```
+src/
+├── main.rs      # 부팅 + 전체 카테고리 실행 + 결과 요약 테이블
+├── runner.rs    # TestResult / try_send / parse_var_resp 공통 유틸
+├── info.rs      # 정보 조회: VERSION, FW_INFO, CAPABILITIES, SELF_TEST, IDEV_INFO, PCR_LOG
+├── certs.rs     # 인증서: LDEV / FMC Alias / RT Alias (ECC384 + MLDSA87)
+├── pcr.rs       # PCR: STASH_MEASUREMENT, EXTEND_PCR, QUOTE_PCRS, INCREMENT_PCR_RESET_COUNTER
+└── crypto.rs    # 서명 검증 스텁: ECDSA384 / LMS / MLDSA87 (Skip — 유효한 키/서명 필요)
+```
+
+새 카테고리 추가: `src/` 아래 모듈을 만들고 `main.rs`의 `categories` 배열에 항목을 추가하면 됩니다.
+
+### 테스트 결과 (기본 실행 기준)
+
+| 카테고리 | PASS | SKIP | 비고 |
+|----------|------|------|------|
+| Info / Status | 7 | 1 | GET_IMAGE_INFO: SET_AUTH_MANIFEST 필요 |
+| Certificates | 6 | 2 | GET_IDEV_*_CERT: POPULATE_IDEV 필요 |
+| PCR / Measurements | 5 | 0 | |
+| Crypto Verify | 0 | 3 | 유효한 키+서명 제공 필요 |
 
 ### Cargo.lock 동기화
 
@@ -76,6 +89,13 @@ cp caliptra-sw/Cargo.lock caliptra_comms/Cargo.lock
 `caliptra_project/Cargo.toml`을 **만들지 않는** 것이 중요합니다.  
 상위에 `[workspace]`가 생기면 Cargo가 `caliptra-sw` 내부 크레이트의  
 `workspace = true` 의존성을 잘못된 workspace root에서 해석합니다.
+
+### SELF_TEST 동작 메모
+
+`SELF_TEST_START`는 FIPS 자가 테스트를 비동기로 예약합니다.  
+테스트는 firmware idle loop(`enter_idle`)에서 실행되며, 실행 중 mailbox를 내부적으로 점유합니다.  
+`step_until_boot_status(0x602)` 후 추가 스텝이 필요한 이유: boot_status가 0x602로 설정되는 시점과  
+`mbox.unlock()` 호출 시점 사이에 짧은 간격이 있기 때문입니다.
 
 ## docs — API 분석 문서
 
