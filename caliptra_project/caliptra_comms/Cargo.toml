@@ -7,9 +7,13 @@ edition = "2021"
 # caliptra_project/Cargo.toml 이 없으므로 Cargo 가 caliptra-sw 의
 # workspace root 를 올바르게 인식한다.
 [dependencies]
-caliptra-hw-model = { path = "../caliptra-sw/hw-model" }
-caliptra-api      = { path = "../caliptra-sw/api" }
-zerocopy          = { version = "0.8.17", features = ["derive"] }
+caliptra-hw-model    = { path = "../caliptra-sw/hw-model" }
+caliptra-api         = { path = "../caliptra-sw/api" }
+caliptra-auth-man-gen = { path = "../caliptra-sw/auth-manifest/gen" }
+caliptra-image-crypto = { path = "../caliptra-sw/image/crypto" }
+caliptra-image-types  = { path = "../caliptra-sw/image/types" }
+openssl              = "*"
+zerocopy             = { version = "0.8.17", features = ["derive"] }
 
 # caliptra-sw 와 동일한 openssl 패치 (MLDSA 지원 fork)
 [patch.crates-io]
